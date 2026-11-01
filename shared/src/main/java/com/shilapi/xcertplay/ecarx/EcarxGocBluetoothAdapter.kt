@@ -33,7 +33,7 @@ class EcarxGocBluetoothAdapter(context: Context) : CarPlayBluetooth {
         validate()
         if (!uuid.equals(GocFirmware.UUID, true) || GocFirmware.mac(deviceAddress) != selectedPhone().address)
             throw IOException("GOC target/UUID does not match the selected phone")
-        val socket = LocalSocket(LocalSocket.SOCKET_STREAM)
+        val socket = LocalSocket() // Default SOCK_STREAM; constructor also exists on legacy APIs.
         try {
             socket.connect(LocalSocketAddress("goc_spp", LocalSocketAddress.Namespace.RESERVED))
             val output = socket.outputStream
