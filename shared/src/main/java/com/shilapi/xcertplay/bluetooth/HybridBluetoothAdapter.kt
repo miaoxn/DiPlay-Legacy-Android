@@ -10,6 +10,7 @@ class HybridBluetoothAdapter(
     val android: AndroidBluetoothAdapter,
     /** USB dongle stack; preferred for data channels when plugged in. */
     val usbDongle: UsbBtBluetoothAdapter? = null,
+    val goc: com.shilapi.xcertplay.ecarx.EcarxGocBluetoothAdapter? = null,
 ) : CarPlayBluetooth {
 
     companion object {
@@ -17,15 +18,18 @@ class HybridBluetoothAdapter(
     }
 
     override fun isSupported(): Boolean =
-        hsae.isSupported() || android.isSupported() || usbDongle?.isSupported() == true
+        if (goc?.selected() == true) goc.isSupported() else
+            hsae.isSupported() || android.isSupported() || usbDongle?.isSupported() == true
 
     override fun isEnabled(): Boolean {
+        if (goc?.selected() == true) return goc.isEnabled()
         if (usbDongle?.isSupported() == true) return usbDongle.isEnabled()
         if (hsae.isSupported() && hsae.isEnabled()) return true
         return android.isEnabled()
     }
 
     override fun enable(): Boolean {
+        if (goc?.selected() == true) return goc.enable()
         var ok = false
         if (hsae.isSupported()) {
             ok = hsae.enable()
@@ -42,10 +46,12 @@ class HybridBluetoothAdapter(
     }
 
     override fun disable() {
+        if (goc?.selected() == true) return Unit
         usbDongle?.disable()
     }
 
     override fun getAdapterName(): String {
+        if (goc?.selected() == true) return goc.getAdapterName()
         val parts = mutableListOf<String>()
         if (hsae.isSupported()) parts.add("HSAE")
         if (android.isSupported()) parts.add("Android")
@@ -55,6 +61,7 @@ class HybridBluetoothAdapter(
     }
 
     override fun getPairedDevices(): List<CarPlayBluetoothDevice> {
+        if (goc?.selected() == true) return goc.getPairedDevices()
         // Merge all stacks, dedupe by MAC. Previously this returned the first
         // non-empty list, so an iPhone paired on the dongle was invisible
         // when HSAE had any (audio-only) paired device (P1-1).
@@ -73,6 +80,7 @@ class HybridBluetoothAdapter(
     }
 
     override fun getConnectedDevice(): CarPlayBluetoothDevice? {
+        if (goc?.selected() == true) return goc.getConnectedDevice()
         // Dongle first: it is the data-capable stack. HSAE may report a
         // connected audio-only device that cannot carry iAP2.
         usbDongle?.let { runCatching { it.getConnectedDevice() } }?.getOrNull()?.let { return it }
@@ -84,6 +92,7 @@ class HybridBluetoothAdapter(
     }
 
     override fun localAddress(context: Context): String? {
+        if (goc?.selected() == true) return goc.localAddress(context)
         // Dongle first: its BD_ADDR is the one the iPhone must pair with for
         // the data channel. Falling back to HSAE's address would pair the
         // iPhone to the audio-only module.
@@ -98,6 +107,7 @@ class HybridBluetoothAdapter(
     }
 
     override fun openRfcommStream(deviceAddress: String, uuid: String): BlockingDuplexByteStream {
+        if (goc?.selected() == true) return goc.openRfcommStream(deviceAddress, uuid)
         val dongle = usbDongle
         if (dongle?.isSupported() == true) {
             if (!dongle.isEnabled()) throw java.io.IOException("USB Bluetooth not enabled")

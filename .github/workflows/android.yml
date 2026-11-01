@@ -21,6 +21,9 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v4
 
+      - name: Test GOC installer transactions without device access
+        run: python3 scripts/tests/test_goc449_transaction.py
+
       - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:

@@ -614,6 +614,7 @@ class CarPlayController(
     fun start() {
         synchronized(this) {
             if (closed) return
+            com.shilapi.xcertplay.ecarx.GocOperationGate.beginSession(this)
         }
         connectionDiagnostic("start transport=${config.transport}")
         if (!hasRequiredUsbService()) return
@@ -847,6 +848,7 @@ class CarPlayController(
                         "teardown end elapsedMs=${elapsedMillis(teardownStarted)} " +
                             "executorTerminated=$executorTerminated",
                     )
+                    com.shilapi.xcertplay.ecarx.GocOperationGate.endSession(this@CarPlayController)
                     teardownComplete.countDown()
                 }
             },
@@ -1392,6 +1394,7 @@ class CarPlayController(
             // Bluetooth only works through the vendor Bluetooth service while
             // getDefaultAdapter() reports null or disabled.
             val hybridBt = CarPlayBluetoothManager.get(appContext)
+            hybridBt.goc?.takeIf { it.selected() }?.validate()
             wirelessChain(1, "Bluetooth adapter supported")
             if (!hybridBt.isSupported()) {
                 throw IOException(
@@ -1553,7 +1556,8 @@ class CarPlayController(
 
             val adapter = bluetoothAdapter
             val hybridAdapter = CarPlayBluetoothManager.get(appContext)
-            if (adapter != null && !adapter.isEnabled) {
+            val goc = hybridAdapter.goc?.takeIf { it.selected() }
+            if (goc == null && adapter != null && !adapter.isEnabled) {
                 runCatching { adapter.enable() }
                 // Upstream #822: wait only while the adapter is actually turning on;
                 // break early on other states instead of sleeping the full deadline.
@@ -1580,8 +1584,8 @@ class CarPlayController(
             val manualPhoneAddress = config.wirelessBluetoothDeviceAddress
             val hasManualPhoneAddress = !manualPhoneAddress.isNullOrBlank() &&
                 BluetoothAdapter.checkBluetoothAddress(manualPhoneAddress)
-            val device = try {
-                if (adapter != null &&
+            val androidDevice = try {
+                if (goc == null && adapter != null &&
                     (adapter.isEnabled || hybridAdapter.isEnabled() || hasManualPhoneAddress)
                 ) {
                     selectWirelessBluetoothDevice(adapter)
@@ -1591,6 +1595,11 @@ class CarPlayController(
             } catch (error: Throwable) {
                 debugLog("wireless Bluetooth device selection not available: ${error.message}; proceeding with Wi-Fi discovery")
                 null
+            }
+            val device = goc?.selectedPhone() ?: androidDevice?.let {
+                com.shilapi.xcertplay.bluetooth.CarPlayBluetoothDevice(
+                    runCatching { it.name }.getOrNull() ?: "iPhone", it.address, false,
+                )
             }
             val hostBluetoothMac = accessoryBluetoothMac(adapter)
             debugLog(
@@ -1832,7 +1841,7 @@ class CarPlayController(
                     "wireless RFCOMM connecting address=${device.address} " +
                         "uuid=$IAP2_IPHONE_UUID",
                 )
-                logBluetoothConnectionSnapshot(device, "before-connect")
+                androidDevice?.let { logBluetoothConnectionSnapshot(it, "before-connect") }
                 val bluetoothStarted = System.nanoTime()
 
                 var stream: BlockingDuplexByteStream? = null
@@ -1853,7 +1862,7 @@ class CarPlayController(
                         stage = "Bluetooth RFCOMM connection"
                         wirelessChain(3, "RFCOMM connecting to iPhone (attempt $attempt/$maxAttempts)")
                         debugLog("wireless RFCOMM connecting (attempt $attempt/$maxAttempts) address=${device.address} uuid=$IAP2_IPHONE_UUID")
-                        logBluetoothConnectionSnapshot(device, "before-connect-$attempt")
+                        androidDevice?.let { logBluetoothConnectionSnapshot(it, "before-connect-$attempt") }
                         val currentStream = hybridAdapter.openRfcommStream(device.address, IAP2_IPHONE_UUID)
                         bluetoothStream = currentStream
                         stream = currentStream
@@ -2251,7 +2260,9 @@ class CarPlayController(
     }
 
     private fun shutdownUsbBluetoothForStalledHandoff() {
-        val dongle = CarPlayBluetoothManager.get(appContext).usbDongle
+        val hybrid = CarPlayBluetoothManager.get(appContext)
+        if (hybrid.goc?.selected() == true) return
+        val dongle = hybrid.usbDongle
         if (dongle == null || !dongle.isSupported()) {
             wirelessDiagnostic("stalled handoff: no USB Bluetooth dongle; leaving other Bluetooth adapters unchanged")
             return
@@ -2363,7 +2374,8 @@ class CarPlayController(
                     // experimental switch on, turn the head unit Bluetooth off to
                     // drop the phone's native Bluetooth link (the native call
                     // screen rides that link); it is turned back on at session end.
-                    if (config.carplayAutoDisconnectBt && !autoBtDisabled.get()) {
+                    if (config.carplayAutoDisconnectBt && !autoBtDisabled.get() &&
+                        CarPlayBluetoothManager.get(appContext).goc?.selected() != true) {
                         val adapter = runCatching { BluetoothAdapter.getDefaultAdapter() }.getOrNull()
                         if (adapter == null) {
                             debugLog("autoBtDisconnect=skipped (no Bluetooth adapter)")

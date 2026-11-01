@@ -1,0 +1,14 @@
+<resources>
+    <string name="settings_goc_title">بلوتوث المصنع ECARX (تجريبي)</string>
+    <string name="settings_goc_description">فقط لجهاز xea406m / API 22 / البرنامج الثابت 449 الذي تم التحقق منه. قم بإقران iPhone أولاً في إعدادات بلوتوث المصنع.</string>
+    <string name="settings_goc_check">فحص التصحيح والخدمة</string>
+    <string name="settings_goc_phone">iPhone المقترن بالمصنع</string>
+    <string name="settings_goc_no_devices">لا توجد أجهزة مقترنة. قم بالإقران في إعدادات المصنع ثم أعد المحاولة.</string>
+    <string name="settings_goc_enable">استخدام بلوتوث GOC الأصلي</string>
+    <string name="settings_goc_next_connection">يسري عند الاتصال التالي. لا يُستخدم بلوتوث USB أثناء تحديد هذا المسار.</string>
+    <string name="settings_goc_install">تثبيت تصحيح بلوتوث النظام</string>
+    <string name="settings_goc_restore">استعادة بلوتوث المصنع</string>
+    <string name="settings_goc_confirm">يتطلب Root ويعدل /system/bin/gocsdk. ثبّت فقط بعد نجاح الاختبار على هذه السيارة. الخروج من DiPlay أو إزالته لا يستعيد ملف النظام. تستخدم الاستعادة نسخة احتياطية موثقة من هذه السيارة. أوقف CarPlay أولاً.</string>
+    <string name="settings_goc_stop_first">أوقف CarPlay وانتظر انتهاء عملية البلوتوث.</string>
+    <string name="settings_goc_working">جارٍ التنفيذ… قد تستغرق عمليات Root حتى ثلاث دقائق.</string>
+</resources>

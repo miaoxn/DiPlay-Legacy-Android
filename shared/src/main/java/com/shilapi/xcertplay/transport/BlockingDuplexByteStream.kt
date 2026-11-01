@@ -10,9 +10,12 @@ import java.io.Closeable
  * worker thread, never Android's main thread.
  */
 interface BlockingDuplexByteStream : Closeable {
+    @Throws(java.io.IOException::class)
     fun send(data: ByteArray)
 
+    @Throws(java.io.IOException::class)
     fun recv(maxBytes: Int, timeoutMillis: Long): ByteArray?
 
+    @Throws(java.io.IOException::class)
     override fun close()
 }

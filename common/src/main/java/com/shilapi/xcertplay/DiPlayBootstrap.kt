@@ -21,6 +21,7 @@ internal object DiPlayBootstrap {
      * Retries if previous attempt occurred before the USB bus finished enumeration.
      */
     @Synchronized fun restoreUsbBluetooth(context: Context, force: Boolean = false) {
+        if (com.shilapi.xcertplay.bluetooth.CarPlayBluetoothManager.get(context).goc?.selected() == true) return
         if (CarPlayBackgroundSession.hasSession()) {
             Log.i(TAG, "USB Bluetooth auto-restore skipped while CarPlay controller is retained")
             return
@@ -167,8 +168,17 @@ internal enum class DefaultConnectionMode(val key: String) {
 
 internal object DiPlayPreferences {
     private fun prefs(context: Context) = context.getSharedPreferences("diplay", Context.MODE_PRIVATE)
-    fun phoneAddress(context: Context): String? = prefs(context).getString("phone_address", null)
-    fun phoneName(context: Context): String = prefs(context).getString("phone_name", null) ?: "Your iPhone"
+    private fun goc(context: Context) = com.shilapi.xcertplay.bluetooth.CarPlayBluetoothManager.get(context).goc?.takeIf { it.selected() }
+    fun phoneAddress(context: Context): String? {
+        val factory = goc(context)
+        return if (factory != null) runCatching { factory.selectedPhone().address }.getOrNull()
+        else prefs(context).getString("phone_address", null)
+    }
+    fun phoneName(context: Context): String {
+        val factory = goc(context)
+        return if (factory != null) runCatching { factory.selectedPhone().name }.getOrDefault("iPhone")
+        else prefs(context).getString("phone_name", null) ?: "Your iPhone"
+    }
     fun savePhone(context: Context, address: String, name: String) {
         prefs(context).edit().putString("phone_address", address).putString("phone_name", name).apply()
     }

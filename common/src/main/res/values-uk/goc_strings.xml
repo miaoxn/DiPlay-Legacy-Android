@@ -1,0 +1,14 @@
+<resources>
+    <string name="settings_goc_title">Штатний Bluetooth ECARX (експериментально)</string>
+    <string name="settings_goc_description">Лише xea406m / API 22 / перевірена прошивка 449. Спочатку створіть пару з iPhone у штатних налаштуваннях Bluetooth.</string>
+    <string name="settings_goc_check">Перевірити патч і службу</string>
+    <string name="settings_goc_phone">iPhone зі штатного списку пар</string>
+    <string name="settings_goc_no_devices">Немає спарених пристроїв. Створіть пару в штатних налаштуваннях і повторіть.</string>
+    <string name="settings_goc_enable">Використовувати штатний GOC Bluetooth</string>
+    <string name="settings_goc_next_connection">Застосовується під час наступного підключення. У цьому режимі USB Bluetooth не використовується.</string>
+    <string name="settings_goc_install">Встановити системний патч Bluetooth</string>
+    <string name="settings_goc_restore">Відновити штатний Bluetooth</string>
+    <string name="settings_goc_confirm">Потрібен Root; змінюється /system/bin/gocsdk. Встановлюйте лише після перевірки на цьому автомобілі. Вихід або видалення DiPlay не відновлює файл. Відновлення використовує перевірену копію з цього автомобіля. Спочатку зупиніть CarPlay.</string>
+    <string name="settings_goc_stop_first">Зупиніть CarPlay і дочекайтеся завершення операції Bluetooth.</string>
+    <string name="settings_goc_working">Виконується… Операції Root можуть тривати до трьох хвилин.</string>
+</resources>

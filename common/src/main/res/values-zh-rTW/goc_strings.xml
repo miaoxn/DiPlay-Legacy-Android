@@ -1,0 +1,14 @@
+<resources>
+    <string name="settings_goc_title">億咖通原廠藍牙（實驗性）</string>
+    <string name="settings_goc_description">僅支援 xea406m / API 22 / 已驗證的 449 韌體。請先在原廠藍牙設定中配對 iPhone。</string>
+    <string name="settings_goc_check">檢查補丁與服務</string>
+    <string name="settings_goc_phone">原廠已配對的 iPhone</string>
+    <string name="settings_goc_no_devices">沒有已配對裝置，請在原廠設定中配對後重試。</string>
+    <string name="settings_goc_enable">使用原廠 GOC 藍牙</string>
+    <string name="settings_goc_next_connection">下次連線生效。選用此模式時不使用 USB 藍牙。</string>
+    <string name="settings_goc_install">安裝系統藍牙補丁</string>
+    <string name="settings_goc_restore">還原原廠藍牙</string>
+    <string name="settings_goc_confirm">需要 Root，並寫入 /system/bin/gocsdk。僅在本車測試成功後安裝。退出或解除安裝 DiPlay 不會還原系統檔案。還原使用本車已驗證的備份。請先停止 CarPlay。</string>
+    <string name="settings_goc_stop_first">請先停止 CarPlay，並等待進行中的藍牙操作結束。</string>
+    <string name="settings_goc_working">處理中，Root 操作最多可能需要三分鐘。</string>
+</resources>

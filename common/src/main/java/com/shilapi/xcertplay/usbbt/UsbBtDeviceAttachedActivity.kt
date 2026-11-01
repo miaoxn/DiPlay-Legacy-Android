@@ -31,7 +31,8 @@ class UsbBtDeviceAttachedActivity : Activity() {
             if (device != null) {
                 Thread({
                     runCatching {
-                        CarPlayBluetoothManager.get(applicationContext).usbDongle?.enable()
+                        val hybrid = CarPlayBluetoothManager.get(applicationContext)
+                        if (hybrid.goc?.selected() != true) hybrid.usbDongle?.enable()
                     }
                 }, "diplay-usbbt-attached").apply {
                     isDaemon = true

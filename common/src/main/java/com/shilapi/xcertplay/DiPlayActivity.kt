@@ -94,6 +94,7 @@ internal enum class SettingsSection {
     EXPERIMENTAL_DISPLAY,
     ADVANCED_MEDIA,
     ADVANCED_CONNECTION,
+    ECARX_GOC,
     CAR_BUTTON,
     AUDIO_ROUTING,
     LOCATION,
@@ -128,6 +129,7 @@ internal object SettingsInformationArchitecture {
             SettingsSection.EXPERIMENTAL_DISPLAY,
             SettingsSection.ADVANCED_MEDIA,
             SettingsSection.ADVANCED_CONNECTION,
+            SettingsSection.ECARX_GOC,
         ),
     )
 }
@@ -1285,7 +1287,80 @@ class DiPlayActivity : ComponentActivity() {
         }
     }
 
+    private val gocManager by lazy { com.shilapi.xcertplay.ecarx.GocManager(applicationContext) }
+    private var gocBusy = false
+
+    private fun <T> gocWork(work: () -> T, done: (T) -> Unit) {
+        if (gocBusy || CarPlayBackgroundSession.hasSession()) {
+            toast(getString(R.string.settings_goc_stop_first))
+            render()
+            return
+        }
+        gocBusy = true
+        toast(getString(R.string.settings_goc_working))
+        Thread({
+            val result = runCatching(work)
+            runOnUiThread {
+                gocBusy = false
+                if (!isFinishing && !isDestroyed) {
+                    result.fold(done) { error ->
+                        render()
+                        AlertDialog.Builder(this).setTitle(R.string.settings_goc_title)
+                            .setMessage(error.message ?: error.javaClass.simpleName)
+                            .setPositiveButton(android.R.string.ok, null).show()
+                    }
+                }
+            }
+        }, "diplay-goc-settings").apply { isDaemon = true; start() }
+    }
+
+    private fun gocSettings(card: LinearLayout) {
+        card.addView(label(getString(R.string.settings_goc_description), 14, MUTED))
+        card.addView(button(getString(R.string.settings_goc_check), false) { gocSystemAction("check") })
+        card.addView(button("${getString(R.string.settings_goc_phone)} · ${gocManager.phoneName().ifBlank { "—" }}", false) {
+            chooseGocPhone()
+        })
+        toggle(card, getString(R.string.settings_goc_enable), getString(R.string.settings_goc_next_connection), gocManager.enabled()) { on ->
+            gocWork({ gocManager.setEnabled(on) }) { markReconnectNeeded(); render() }
+        }
+        card.addView(button(getString(R.string.settings_goc_install), false) { gocConfirm("install") })
+        card.addView(button(getString(R.string.settings_goc_restore), false) { gocConfirm("rollback") })
+    }
+
+    private fun chooseGocPhone() {
+        gocWork({ gocManager.devices() }) { result ->
+            if (result.devices.isEmpty()) toast(getString(R.string.settings_goc_no_devices))
+            else AlertDialog.Builder(this).setTitle(R.string.settings_goc_phone)
+                .setItems(result.devices.map { it.toString() }.toTypedArray()) { _, index ->
+                    gocWork({ gocManager.select(result.devices[index], result.local) }) {
+                        markReconnectNeeded()
+                        render()
+                    }
+                }.setNegativeButton(android.R.string.cancel, null).show()
+        }
+    }
+
+    private fun gocConfirm(action: String) {
+        AlertDialog.Builder(this).setTitle(if (action == "install") R.string.settings_goc_install else R.string.settings_goc_restore)
+            .setMessage(R.string.settings_goc_confirm)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(android.R.string.ok) { _, _ -> gocSystemAction(action) }.show()
+    }
+
+    private fun gocSystemAction(action: String) {
+        gocWork({ gocManager.systemAction(action) }) { result ->
+            if (action != "check") markReconnectNeeded()
+            render()
+            AlertDialog.Builder(this).setTitle(R.string.settings_goc_title).setMessage(result)
+                .setPositiveButton(android.R.string.ok, null).show()
+        }
+    }
+
     private fun allSettingsSections(content: LinearLayout) {
+        if (com.shilapi.xcertplay.ecarx.GocFirmware.supported(Build.VERSION.SDK_INT, Build.DEVICE)) {
+            filteredSection(content, SettingsSection.ECARX_GOC,
+                getString(R.string.settings_goc_title), R.drawable.ic_dp_connection, ::gocSettings)
+        }
         filteredSection(content, SettingsSection.CARPLAY_CONTROLS,
             getString(R.string.carplay_controls), R.drawable.ic_dp_controls) { card ->
             val gestureFingers = listOf(2, 3, 4)
@@ -4280,6 +4355,7 @@ class DiPlayActivity : ComponentActivity() {
 
     @android.annotation.SuppressLint("MissingPermission")
     private fun choosePhone() {
+        if (gocManager.enabled()) { chooseGocPhone(); return }
         if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
             bluetoothPermission.launch(Manifest.permission.BLUETOOTH_CONNECT); return
         }

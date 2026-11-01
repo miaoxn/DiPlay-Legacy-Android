@@ -1,0 +1,14 @@
+<resources>
+    <string name="settings_goc_title">ECARX factory Bluetooth (experimental)</string>
+    <string name="settings_goc_description">For xea406m / API 22 / verified 449 firmware. Pair your iPhone in the factory Bluetooth settings first.</string>
+    <string name="settings_goc_check">Check patch and service</string>
+    <string name="settings_goc_phone">Factory-paired iPhone</string>
+    <string name="settings_goc_no_devices">No paired devices. Pair in the factory settings and retry.</string>
+    <string name="settings_goc_enable">Use factory GOC Bluetooth</string>
+    <string name="settings_goc_next_connection">Takes effect on the next connection. USB Bluetooth is not used while this route is selected.</string>
+    <string name="settings_goc_install">Install system Bluetooth patch</string>
+    <string name="settings_goc_restore">Restore factory Bluetooth</string>
+    <string name="settings_goc_confirm">Requires Root and writes /system/bin/gocsdk. Install only after successful testing on this vehicle. Exiting or uninstalling DiPlay does not restore the system file. Restore uses this vehicle’s verified backup. Stop CarPlay before proceeding.</string>
+    <string name="settings_goc_stop_first">Stop CarPlay and wait for any Bluetooth operation to finish.</string>
+    <string name="settings_goc_working">Working… Root operations can take up to three minutes.</string>
+</resources>
