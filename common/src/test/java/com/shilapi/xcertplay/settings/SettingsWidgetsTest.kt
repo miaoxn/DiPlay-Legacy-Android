@@ -32,6 +32,21 @@ class SettingsWidgetsTest {
         }
     }
 
+    @Test fun preMarshmallowSwitchRowsDrawThemedThumbAndTrack() {
+        val previousRelease = android.os.Build.VERSION.RELEASE
+        try {
+            org.robolectric.shadows.ShadowBuild.setVersionRelease("5.1")
+            val row = SettingsWidgets.createSwitchRow(context, "Title", "Details", true,
+                SettingsTheme.CARD, onChanged = {})
+            assertTrue(row.switch.thumbDrawable is android.graphics.drawable.StateListDrawable)
+            assertTrue(row.switch.trackDrawable is android.graphics.drawable.StateListDrawable)
+            assertEquals("", row.switch.textOn)
+            assertEquals("", row.switch.textOff)
+        } finally {
+            org.robolectric.shadows.ShadowBuild.setVersionRelease(previousRelease)
+        }
+    }
+
     @Test fun choicesEmitOnlyNewSelectionsAndIgnoreClearingTheSelection() {
         val saved = mutableListOf<MfiTarget>()
         val row = ConnectionSettingsSection.createMfiTargetChoice(context, MfiTarget.LOCAL,

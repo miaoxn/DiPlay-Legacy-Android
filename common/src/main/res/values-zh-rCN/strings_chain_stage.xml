@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chain_hint_bluetooth">确认蓝牙棒已插入、iPhone 已配对。</string>
+    <string name="chain_hint_hotspot">检查车机热点，并在 iPhone 上为该网络关闭“私有无线局域网地址”。</string>
+    <string name="chain_hint_usb_permission">重新插拔数据线，并在授权提示中允许 USB 权限。</string>
+    <string name="chain_stage_entered">阶段已进入 · %1$d 秒</string>
+    <string name="chain_stage_waiting">当前阶段已等待 %1$d 秒 · 若持续不变，请拍摄此界面</string>
+    <string name="chain_step_current">[%1$d/%2$d] %3$s · 已等待 %4$s</string>
+    <string name="chain_step_failed">[%1$d/%2$d] %3$s · 失败 · 等待 %4$s</string>
+    <string name="chain_step_wired_01">USB 已连接</string>
+    <string name="chain_step_wired_02">USB 授权</string>
+    <string name="chain_step_wired_03">iAP2 会话</string>
+    <string name="chain_step_wired_04">NCM 配置</string>
+    <string name="chain_step_wired_05">NCM 桥接</string>
+    <string name="chain_step_wired_06">USBMUX 主机</string>
+    <string name="chain_step_wired_07">配对</string>
+    <string name="chain_step_wired_08">CarKit 服务</string>
+    <string name="chain_step_wired_09">iAP2 通道</string>
+    <string name="chain_step_wired_10">VPN 已绑定</string>
+    <string name="chain_step_wired_11">传输已接入</string>
+    <string name="chain_step_wired_12">MFi 就绪</string>
+    <string name="chain_step_wired_13">监听已绑定</string>
+    <string name="chain_step_wired_14">StartSession 已发</string>
+    <string name="chain_step_wired_15">mDNS 已应答</string>
+    <string name="chain_step_wired_16">会话已激活</string>
+    <string name="chain_step_wireless_01">蓝牙适配器</string>
+    <string name="chain_step_wireless_02">蓝牙已开启</string>
+    <string name="chain_step_wireless_03">RFCOMM 连接中</string>
+    <string name="chain_step_wireless_04">iAP2 通道</string>
+    <string name="chain_step_wireless_05">正在启动热点</string>
+    <string name="chain_step_wireless_06">热点就绪</string>
+    <string name="chain_step_wireless_07">mDNS 广播中</string>
+    <string name="chain_step_wireless_08">隧道已打开</string>
+    <string name="chain_step_wireless_09">隧道就绪</string>
+    <string name="chain_step_wireless_10">交接完成</string>
+    <string name="chain_step_wireless_11">传输已接入</string>
+    <string name="chain_step_wireless_12">会话已激活</string>
+</resources>

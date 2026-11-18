@@ -1,5 +1,6 @@
 package com.shilapi.xcertplay
 
+import android.app.ActivityManager
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
@@ -160,5 +161,22 @@ internal class HomeScreenMonitor(context: Context, private val onChange: (Boolea
                 PackageManager.MATCH_DEFAULT_ONLY,
             )?.activityInfo?.packageName
         }.getOrNull()?.takeIf { it != "android" && it != context.packageName }
+
+        /**
+         * The foreground package on pre-Lollipop units, from the top of the
+         * running-task list (needs GET_TASKS, declared in the manifest).
+         * Null on API 21+, where the task list no longer reports other
+         * apps, and on any failure: callers treat null as "unknown" and
+         * must not guess from it.
+         */
+        fun foregroundPackage(context: Context): String? {
+            if (realSdkInt() >= 21) return null
+            return runCatching {
+                @Suppress("DEPRECATION")
+                val manager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+                @Suppress("DEPRECATION")
+                manager?.getRunningTasks(1)?.firstOrNull()?.topActivity?.packageName
+            }.getOrNull()
+        }
     }
 }

@@ -7,6 +7,9 @@ object CarPlayBluetoothManager {
     @Volatile
     private var instance: HybridBluetoothAdapter? = null
 
+    @Volatile
+    var sourceModeProvider: () -> BluetoothSource = { BluetoothSource.AUTO }
+
     fun get(context: Context): HybridBluetoothAdapter {
         return instance ?: synchronized(this) {
             instance ?: HybridBluetoothAdapter(
@@ -15,6 +18,7 @@ object CarPlayBluetoothManager {
                 // USB dongle stack: constructed lazily; enable() is opt-in and
                 // only auto-runs when no other stack exists (see Hybrid).
                 UsbBtBluetoothAdapter(context.applicationContext),
+                sourceProvider = { sourceModeProvider() },
             ).also { instance = it }
         }
     }

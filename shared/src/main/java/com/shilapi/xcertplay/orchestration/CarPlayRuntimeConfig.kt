@@ -73,9 +73,14 @@ class CarPlayRuntimeConfig(
     val hostapdSsid: String? = null,
     val hostapdPassphrase: String? = null,
     val hostapdChannel: Int = 1,
+    /** Issue #344: Apple vendor IE on the root hostapd beacon; only used in HOSTAPD mode. */
+    val hostapdAppleVendorIe: Boolean = false,
+    /** Issue #343: auto-disconnect phone Bluetooth after wireless CarPlay connects (experimental). */
+    val carplayAutoDisconnectBt: Boolean = false,
     val userspaceNetworkEnabled: Boolean = true,
     /** Issue #266: direct usbfs discovery/open for ROMs whose UsbManager list stays empty. */
     val directUsbfsMode: Boolean = false,
+    val wirelessCandidateAddresses: List<String> = emptyList(),
 ) {
     init {
         require(iphoneDevices.all { it.vendorId == APPLE_VENDOR_ID }) {
@@ -130,11 +135,20 @@ class CarPlayRuntimeConfig(
             require(ssid.encodeToByteArray().size <= 32) {
                 "hostapdSsid must be at most 32 UTF-8 bytes"
             }
+            // Both values are written into a config file hostapd reads as root,
+            // one directive per line: a line break would inject directives.
+            require(!com.shilapi.xcertplay.network.HostapdConfig.hasControlCharacter(ssid)) {
+                "hostapdSsid must not contain control characters"
+            }
             val passphrase = hostapdPassphrase.orEmpty()
             require('\u0000' !in passphrase) {
                 "hostapdPassphrase must not contain U+0000"
             }
-            require(passphrase.length in 8..63) {
+            require(!com.shilapi.xcertplay.network.HostapdConfig.hasControlCharacter(passphrase)) {
+                "hostapdPassphrase must not contain control characters"
+            }
+            // hostapd counts the passphrase in bytes, not characters.
+            require(passphrase.encodeToByteArray().size in 8..63) {
                 "hostapdPassphrase must be between 8 and 63 characters"
             }
             require(hostapdChannel in 1..13) {

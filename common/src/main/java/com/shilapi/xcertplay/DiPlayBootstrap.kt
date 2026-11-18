@@ -2,6 +2,7 @@ package com.shilapi.xcertplay
 
 import android.content.Context
 import android.os.Build
+import android.util.Log
 import com.shilapi.xcertplay.compat.realSdkInt
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
 import com.shilapi.xcertplay.mfi.LocalMfiAuthenticationClient
@@ -20,10 +21,18 @@ internal object DiPlayBootstrap {
      * Retries if previous attempt occurred before the USB bus finished enumeration.
      */
     @Synchronized fun restoreUsbBluetooth(context: Context, force: Boolean = false) {
+        if (CarPlayBackgroundSession.hasSession()) {
+            Log.i(TAG, "USB Bluetooth auto-restore skipped while CarPlay controller is retained")
+            return
+        }
         val now = System.currentTimeMillis()
         if (!force && usbBtRestoreTried && (now - lastRestoreAttemptMillis < 3000L)) return
         lastRestoreAttemptMillis = now
         usbBtRestoreTried = true
+        com.shilapi.xcertplay.bluetooth.CarPlayBluetoothManager.sourceModeProvider = {
+            AirPlayPersistence.loadBluetoothSource(context.applicationContext)
+        }
+        if (AirPlayPersistence.loadBluetoothSource(context) == com.shilapi.xcertplay.bluetooth.BluetoothSource.BUILTIN) return
         if (!AirPlayPersistence.loadUsbBtAutoStart(context)) return
         val appContext = context.applicationContext
         Thread({
@@ -142,6 +151,8 @@ internal object DiPlayBootstrap {
     }
 
     private val AUTH_FILES = listOf("identity.pk8", "certificate.p7b")
+
+    private const val TAG = "DiPlayBootstrap"
 }
 
 internal enum class DefaultConnectionMode(val key: String) {
@@ -160,10 +171,81 @@ internal enum class DefaultConnectionMode(val key: String) {
 
 internal object DiPlayPreferences {
     private fun prefs(context: Context) = context.getSharedPreferences("diplay", Context.MODE_PRIVATE)
-    fun phoneAddress(context: Context): String? = prefs(context).getString("phone_address", null)
-    fun phoneName(context: Context): String = prefs(context).getString("phone_name", null) ?: "Your iPhone"
+
+    fun knownPhones(context: Context): List<com.shilapi.xcertplay.bluetooth.KnownPhone> {
+        val raw = prefs(context).getString("known_phones", null)
+        val list = com.shilapi.xcertplay.bluetooth.KnownPhone.parseList(raw)
+        if (list.isNotEmpty()) return list
+        val legacyAddr = prefs(context).getString("phone_address", null) ?: return emptyList()
+        val legacyName = prefs(context).getString("phone_name", null) ?: "Your iPhone"
+        val migrated = listOf(com.shilapi.xcertplay.bluetooth.KnownPhone(legacyAddr, legacyName, lastConnectedTime = System.currentTimeMillis()))
+        saveKnownPhones(context, migrated)
+        return migrated
+    }
+
+    fun saveKnownPhones(context: Context, phones: List<com.shilapi.xcertplay.bluetooth.KnownPhone>) {
+        val serialized = com.shilapi.xcertplay.bluetooth.KnownPhone.serializeList(phones)
+        val primary = phones.firstOrNull()
+        prefs(context).edit()
+            .putString("known_phones", serialized)
+            .putString("phone_address", primary?.address)
+            .putString("phone_name", primary?.displayName())
+            .apply()
+    }
+
+    fun recordPhoneConnected(context: Context, address: String, name: String? = null) {
+        val normalizedAddr = address.uppercase(java.util.Locale.US)
+        val current = knownPhones(context).toMutableList()
+        val index = current.indexOfFirst { it.address.equals(normalizedAddr, ignoreCase = true) }
+        val entry = if (index >= 0) {
+            val old = current.removeAt(index)
+            old.copy(
+                name = name?.takeIf { it.isNotBlank() } ?: old.name,
+                lastConnectedTime = System.currentTimeMillis(),
+            )
+        } else {
+            com.shilapi.xcertplay.bluetooth.KnownPhone(
+                address = normalizedAddr,
+                name = name?.takeIf { it.isNotBlank() } ?: "iPhone",
+                lastConnectedTime = System.currentTimeMillis(),
+            )
+        }
+        current.add(0, entry)
+        saveKnownPhones(context, current)
+    }
+
+    fun updatePhoneAlias(context: Context, address: String, alias: String?) {
+        val current = knownPhones(context).map {
+            if (it.address.equals(address, ignoreCase = true)) {
+                it.copy(alias = alias?.trim()?.ifEmpty { null })
+            } else it
+        }
+        saveKnownPhones(context, current)
+    }
+
+    fun removeKnownPhone(context: Context, address: String) {
+        val current = knownPhones(context).filterNot { it.address.equals(address, ignoreCase = true) }
+        saveKnownPhones(context, current)
+    }
+
+    fun selectPrimaryPhone(context: Context, address: String) {
+        val current = knownPhones(context).toMutableList()
+        val index = current.indexOfFirst { it.address.equals(address, ignoreCase = true) }
+        if (index >= 0) {
+            val item = current.removeAt(index).copy(lastConnectedTime = System.currentTimeMillis())
+            current.add(0, item)
+            saveKnownPhones(context, current)
+        }
+    }
+
+    fun phoneAddress(context: Context): String? =
+        knownPhones(context).firstOrNull()?.address ?: prefs(context).getString("phone_address", null)
+
+    fun phoneName(context: Context): String =
+        knownPhones(context).firstOrNull()?.displayName() ?: prefs(context).getString("phone_name", null) ?: "Your iPhone"
+
     fun savePhone(context: Context, address: String, name: String) {
-        prefs(context).edit().putString("phone_address", address).putString("phone_name", name).apply()
+        recordPhoneConnected(context, address, name)
     }
     fun defaultConnectionMode(context: Context) =
         DefaultConnectionMode.fromKey(prefs(context).getString("default_connection_mode", null))
@@ -175,5 +257,9 @@ internal object DiPlayPreferences {
     fun autoConnect(context: Context) = prefs(context).getBoolean("auto_connect", false)
     fun saveAutoConnect(context: Context, value: Boolean) {
         prefs(context).edit().putBoolean("auto_connect", value).apply()
+    }
+    fun usbDeviceAutoLaunch(context: Context) = prefs(context).getBoolean("usb_device_auto_launch", false)
+    fun saveUsbDeviceAutoLaunch(context: Context, value: Boolean) {
+        prefs(context).edit().putBoolean("usb_device_auto_launch", value).apply()
     }
 }

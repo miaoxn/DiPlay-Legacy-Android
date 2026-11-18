@@ -21,12 +21,32 @@ class WirelessStartupRetryBudgetTest {
         assertTrue(budget.firstFrame(one, 100))
         assertFalse(budget.firstFrame(one, 200))
         assertFalse(budget.resetIfStable(one, 60_099))
-        budget.disconnected()
+        assertFalse(budget.disconnected(60_099))
         assertFalse(budget.resetIfStable(one, 60_100))
         val two = Any()
         assertTrue(budget.firstFrame(two, 70_000))
         assertFalse(budget.resetIfStable(one, 130_000))
         assertTrue(budget.resetIfStable(two, 130_000))
         assertEquals(0, budget.retries)
+    }
+
+    @Test fun stableSessionEndingResetsBudgetAtDisconnect() {
+        // IKTCRS: the host's one-shot +60s check can miss its window; the
+        // disconnect itself must settle a session that had been stable.
+        val budget = WirelessStartupRetryBudget()
+        budget.nextDelayMillis()
+        budget.nextDelayMillis()
+        assertEquals(2, budget.retries)
+        val short = Any()
+        assertTrue(budget.firstFrame(short, 1_000))
+        // Ends before the stability window: nothing is earned back.
+        assertFalse(budget.disconnected(30_000))
+        assertEquals(2, budget.retries)
+        val stable = Any()
+        assertTrue(budget.firstFrame(stable, 100_000))
+        // Ends after 60s of frames: budget restored without the timer.
+        assertTrue(budget.disconnected(160_000))
+        assertEquals(0, budget.retries)
+        assertEquals(2_000L, budget.nextDelayMillis())
     }
 }

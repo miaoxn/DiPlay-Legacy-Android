@@ -1,6 +1,9 @@
 package com.shilapi.xcertplay.network
 
+import android.os.SystemClock
 import android.util.Log
+import com.shilapi.xcertplay.airplay.ChainKind
+import com.shilapi.xcertplay.airplay.ChainStageEvent
 import com.shilapi.xcertplay.transport.EthernetIpv6Codec
 import com.shilapi.xcertplay.transport.NcmUsbBridge
 import java.io.Closeable
@@ -23,6 +26,8 @@ class LwipNcmBridge(
     private val hostMac: ByteArray,
     private val hostLinkLocal: String,
     private val onDebugLog: (String) -> Unit = {},
+    /** Stage events for the connection panel; same emission points as the [15/16]/[16/16] lines. */
+    private val onStageEvent: (ChainStageEvent) -> Unit = {},
     private val onError: (Throwable) -> Unit,
     @Volatile var mdnsResponder: WiredMdnsResponder? = null,
 ) : Closeable {
@@ -245,6 +250,7 @@ class LwipNcmBridge(
                             "bytes=${mdnsAnswers.sumOf { it.size }} enqueued=$enqueued"
                         Log.i(TAG, answerMsg)
                         runCatching { onDebugLog(answerMsg) }
+                        runCatching { onStageEvent(ChainStageEvent(ChainKind.WIRED, 15, SystemClock.elapsedRealtime(), answerMsg)) }
                     }
                     maybeLogMdnsDiag()
                     sendRouterAdvertisement(targetMac = ipv6.sourceMac)
@@ -307,6 +313,7 @@ class LwipNcmBridge(
                         val tcpMsg = "WIRED-CHAIN [16/16] first TCP packet passed to lwIP (iPhone -> 7000)"
                         Log.i(TAG, tcpMsg)
                         runCatching { onDebugLog(tcpMsg) }
+                        runCatching { onStageEvent(ChainStageEvent(ChainKind.WIRED, 16, SystemClock.elapsedRealtime(), tcpMsg)) }
                     }
                     // Issue #270: after a session ends, the iPhone keeps sending TCP to the
                     // previous session's video dataPort during the next attempt. Those packets

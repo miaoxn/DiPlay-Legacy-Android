@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chain_hint_bluetooth">Make sure the Bluetooth dongle is plugged in and the iPhone is paired.</string>
+    <string name="chain_hint_hotspot">Check the car hotspot and turn off Private Wi-Fi Address on the iPhone for this network.</string>
+    <string name="chain_hint_usb_permission">Unplug and plug the cable back in, then allow the USB permission prompt.</string>
+    <string name="chain_stage_entered">Stage entered · %1$d s</string>
+    <string name="chain_stage_waiting">This stage has waited %1$d s · if it stays, photograph this screen</string>
+    <string name="chain_step_current">[%1$d/%2$d] %3$s · waiting %4$s</string>
+    <string name="chain_step_failed">[%1$d/%2$d] %3$s · failed · waited %4$s</string>
+    <string name="chain_step_wired_01">USB attached</string>
+    <string name="chain_step_wired_02">USB permission</string>
+    <string name="chain_step_wired_03">iAP2 session</string>
+    <string name="chain_step_wired_04">NCM config</string>
+    <string name="chain_step_wired_05">NCM bridge</string>
+    <string name="chain_step_wired_06">USBMUX host</string>
+    <string name="chain_step_wired_07">Pairing</string>
+    <string name="chain_step_wired_08">CarKit service</string>
+    <string name="chain_step_wired_09">iAP2 channel</string>
+    <string name="chain_step_wired_10">VPN bound</string>
+    <string name="chain_step_wired_11">Transport attached</string>
+    <string name="chain_step_wired_12">MFi ready</string>
+    <string name="chain_step_wired_13">Listener bound</string>
+    <string name="chain_step_wired_14">StartSession sent</string>
+    <string name="chain_step_wired_15">mDNS answered</string>
+    <string name="chain_step_wired_16">Session active</string>
+    <string name="chain_step_wireless_01">Bluetooth adapter</string>
+    <string name="chain_step_wireless_02">Bluetooth on</string>
+    <string name="chain_step_wireless_03">RFCOMM connecting</string>
+    <string name="chain_step_wireless_04">iAP2 channel</string>
+    <string name="chain_step_wireless_05">Starting hotspot</string>
+    <string name="chain_step_wireless_06">Hotspot ready</string>
+    <string name="chain_step_wireless_07">mDNS advertising</string>
+    <string name="chain_step_wireless_08">Tunnel opened</string>
+    <string name="chain_step_wireless_09">Tunnel ready</string>
+    <string name="chain_step_wireless_10">Handoff done</string>
+    <string name="chain_step_wireless_11">Transport attached</string>
+    <string name="chain_step_wireless_12">Session active</string>
+</resources>

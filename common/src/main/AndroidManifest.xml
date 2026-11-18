@@ -3,6 +3,8 @@
 
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Legacy stock tethering (including ECARX Android 5.1) checks this permission. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
@@ -22,11 +24,18 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Optional: the dashboard map as a card over the home screen. -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- Pre-Lollipop only: the boot fronting watchdog reads the foreground task to tell a home
+         screen from another app before re-pulling DiPlay forward (IKTCRS). No effect on API 21+,
+         where getRunningTasks no longer reports other apps' tasks. -->
+    <uses-permission android:name="android.permission.GET_TASKS" />
     <!-- Optional, owner-enabled Usage Access for the verified DiLink 5.1 cluster profile. -->
     <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
     <!-- The centre card also follows whichever launcher is the default home. -->
     <queries>
         <package android:name="com.byd.carsettings" />
+        <intent>
+            <action android:name="com.anwsdk.service.AnwPhoneLink" />
+        </intent>
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.HOME" />
@@ -194,6 +203,27 @@
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- USB-device auto-launch (IKUZ2R follow-up): bare USB_DEVICE_ATTACHED filter, no
+             device-filter meta-data, so it fires for every attach without joining USB
+             default-handler resolution. Device-kind filtering and the opt-in gate live in code. -->
+        <receiver
+            android:name="com.shilapi.xcertplay.UsbDeviceAutoLaunchReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name="com.shilapi.xcertplay.WifiStateReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.net.wifi.STATE_CHANGE" />
             </intent-filter>
         </receiver>
 

@@ -2,7 +2,9 @@ package com.shilapi.xcertplay.network
 
 import java.net.InetAddress
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class HotspotAddressPolicyTest {
@@ -46,5 +48,38 @@ class HotspotAddressPolicyTest {
     @Test
     fun anEmptyInterfaceHasNoAddress() {
         assertNull(HotspotAddressPolicy.select(emptyList()))
+    }
+
+    @Test
+    fun offeredAddressesDropNonPrimaryIpv6LinkLocalsButKeepMultiIpv4() {
+        val primary = address("192.168.49.1")
+        val secondIpv4 = address("192.168.49.2")
+        val linkLocal = address("fe80::e0dc:ffff:fe5b:c6d1")
+
+        assertEquals(
+            listOf(primary, secondIpv4),
+            HotspotAddressPolicy.offeredAddresses(primary, listOf(secondIpv4, linkLocal, primary)),
+        )
+    }
+
+    @Test
+    fun offeredAddressesKeepAnIpv6LinkLocalPrimary() {
+        val primary = address("fe80::e0dc:ffff:fe5b:c6d1")
+        val ipv4 = address("192.168.49.1")
+
+        assertEquals(
+            listOf(primary, ipv4),
+            HotspotAddressPolicy.offeredAddresses(primary, listOf(ipv4)),
+        )
+    }
+
+    @Test
+    fun onlyAUsableIpv4CountsForTheIpv6Grace() {
+        assertTrue(HotspotAddressPolicy.hasUsableIpv4(listOf(address("192.168.49.1"))))
+        assertFalse(
+            HotspotAddressPolicy.hasUsableIpv4(
+                listOf(address("127.0.0.1"), address("fe80::e0dc:ffff:fe5b:c6d1")),
+            ),
+        )
     }
 }

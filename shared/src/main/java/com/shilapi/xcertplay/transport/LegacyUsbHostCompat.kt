@@ -138,19 +138,44 @@ internal object LegacyUsbHostCompat {
         return ConfigurationResult(ok, errno, active)
     }
 
+    // IKTCRS instrumentation: a failed framework claim used to be invisible
+    // (bare false, no errno above API 28), so "another process holds this
+    // interface" (e.g. an OEM iPod service racing DiPlay) was indistinguishable
+    // from a transient settle failure. Count every claim failure process-wide
+    // and log sparsely — the 1st, then every 10th — with iface, path and
+    // errno; callers can read the running total via claimFailureTotal() and
+    // attach it to their own final-failure lines.
+    private val claimFailureTotal = java.util.concurrent.atomic.AtomicInteger(0)
+
+    fun claimFailureTotal(): Int = claimFailureTotal.get()
+
+    private fun noteClaimFailure(usbInterface: UsbInterface, path: String, errno: Int?): ClaimResult {
+        val total = claimFailureTotal.incrementAndGet()
+        if (total == 1 || total % 10 == 0) {
+            Log.w(
+                TAG,
+                "usb claim failed iface=${usbInterface.id} path=$path " +
+                    "errno=${errno ?: "none"} totalClaimFailures=$total",
+            )
+        }
+        return ClaimResult(false, errno)
+    }
+
     fun claim(connection: SharedUsbConnection, usbInterface: UsbInterface): ClaimResult {
         if (connection.claimInterface(usbInterface, true)) return ClaimResult(true, null)
-        if (realSdkInt() > Build.VERSION_CODES.P) return ClaimResult(false, null)
+        if (realSdkInt() > Build.VERSION_CODES.P) return noteClaimFailure(usbInterface, "framework", null)
         val fd = runCatching { connection.fileDescriptor }.getOrDefault(-1)
-        return forceClaimFd(fd, usbInterface)
+        val result = forceClaimFd(fd, usbInterface)
+        return if (result.claimed) result else noteClaimFailure(usbInterface, "usbfs", result.errno)
     }
 
     /** Framework-typed overload kept for callers that own a plain connection (CH341 host). */
     fun claim(connection: UsbDeviceConnection, usbInterface: UsbInterface): ClaimResult {
         if (connection.claimInterface(usbInterface, true)) return ClaimResult(true, null)
-        if (realSdkInt() > Build.VERSION_CODES.P) return ClaimResult(false, null)
+        if (realSdkInt() > Build.VERSION_CODES.P) return noteClaimFailure(usbInterface, "framework", null)
         val fd = runCatching { connection.fileDescriptor }.getOrDefault(-1)
-        return forceClaimFd(fd, usbInterface)
+        val result = forceClaimFd(fd, usbInterface)
+        return if (result.claimed) result else noteClaimFailure(usbInterface, "usbfs", result.errno)
     }
 
     private fun forceClaimFd(fd: Int, usbInterface: UsbInterface): ClaimResult {

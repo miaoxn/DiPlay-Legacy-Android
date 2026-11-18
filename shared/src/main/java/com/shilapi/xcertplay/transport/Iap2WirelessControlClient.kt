@@ -30,6 +30,7 @@ class Iap2WirelessControlClient(
         onReady: () -> Unit = {},
         beforeStartSession: () -> Unit = {},
         onStartSessionSent: (Iap2StartSessionSent) -> Unit = {},
+        onPostTransportWiFiConfigurationSent: () -> Unit = {},
         onIncoming: (Iap2Frame) -> Unit = {},
         // Evaluated only in the authenticated control loop when its original deadline expires.
         // The caller must prove that the current CarPlay session is usable before keeping it alive.
@@ -219,7 +220,17 @@ class Iap2WirelessControlClient(
 
                     WIRELESS_CARPLAY_UPDATE -> {
                         val available = Iap2WirelessMessages.wirelessCarPlayAvailability(incoming)
-                        if (available) wirelessCarPlayAvailableSeen = true
+                        if (available) {
+                            wirelessCarPlayAvailableSeen = true
+                            if (carPlayStartSessionsSent == 0) {
+                                beforeStartSession()
+                                sendStartSession(endpoint, ::sendControl, onStartSessionSent)
+                                stage = later(stage, Iap2WirelessControlStage.CARPLAY_START_SENT)
+                                carPlayStartSessionsSent++
+                                lastStartSessionSentAtMillis = System.currentTimeMillis()
+                                onProgress("iap2 tx=0x4301 carplay-start-session")
+                            }
+                        }
                         onProgress("iap2 rx=0x4e0d wireless-carplay-update available=$available")
                     }
 
@@ -261,6 +272,7 @@ class Iap2WirelessControlClient(
                             onProgress(
                                 "iap2 tx=0x5703 post-transport accessory-wifi-configuration",
                             )
+                            onPostTransportWiFiConfigurationSent()
                         }
                     }
 

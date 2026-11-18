@@ -215,8 +215,131 @@ class AudioFocusAutoYieldTest {
         assertNull(shadowOf(manager).lastAbandonedAudioFocusRequest)
     }
 
-    private fun coordinator(enabled: Boolean = true, autoYield: Boolean = true) =
-        AudioFocusCoordinator(context, enabled, autoYield).also(coordinators::add)
+    @Test fun announcementDuckRampsVolumeSmoothlyOnNormalCompletion() {
+        var now = 0L
+        val coordinator = coordinator(announcementDuck = true, nowNs = { now })
+        val media = track()
+        coordinator.acquire(media, AudioChannel.MEDIA, attributes)
+        assertTrue(volumes(media).isEmpty())
+
+        // Announcement frame arrives (e.g. navigation prompt starts)
+        coordinator.onAnnouncementFrame(AudioChannel.NAVIGATION)
+        assertEquals(listOf(0.2f), volumes(media))
+
+        // Time advances 200ms without new frames
+        now = 205_000_000L
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(205))
+
+        // Announcement release triggers and ramp starts
+        // Let looper execute all scheduled ramp steps (350ms total)
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(350))
+
+        val volList = volumes(media)
+        assertTrue(volList.size > 5)
+        assertEquals(0.2f, volList[0], 0.001f)
+        assertEquals(1f, volList.last(), 0.001f)
+        for (i in 1 until volList.size) {
+            assertTrue(volList[i] >= volList[i - 1])
+        }
+    }
+
+    @Test fun announcementDuckRampInterruptedByBackToBackAnnouncement() {
+        var now = 0L
+        val coordinator = coordinator(announcementDuck = true, nowNs = { now })
+        val media = track()
+        coordinator.acquire(media, AudioChannel.MEDIA, attributes)
+        assertTrue(volumes(media).isEmpty())
+
+        // First announcement
+        coordinator.onAnnouncementFrame(AudioChannel.NAVIGATION)
+        assertEquals(listOf(0.2f), volumes(media))
+
+        // 200ms passes, release triggers ramp
+        now = 205_000_000L
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(205))
+
+        // Let ramp progress a few steps (50ms = 2 steps)
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(50))
+        val midRampVolume = volumes(media).last()
+        assertTrue(midRampVolume > 0.2f && midRampVolume < 1f)
+
+        // Second announcement arrives immediately (burst)
+        now = 260_000_000L
+        coordinator.onAnnouncementFrame(AudioChannel.NAVIGATION)
+
+        // Ramp should be cancelled immediately and volume returned to 0.2f
+        assertEquals(0.2f, volumes(media).last(), 0.001f)
+
+        // Idle looper; volume should NOT continue ramping up while second announcement is active
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(100))
+        assertEquals(0.2f, volumes(media).last(), 0.001f)
+
+        // Second announcement ends
+        now = 470_000_000L
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(205))
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(350))
+        assertEquals(1f, volumes(media).last(), 0.001f)
+    }
+
+    @Test fun transientFocusLossDuringRampMutesImmediatelyAndGainRestoresWithRamp() {
+        var now = 0L
+        val coordinator = coordinator(announcementDuck = true, nowNs = { now })
+        val media = track()
+        coordinator.acquire(media, AudioChannel.MEDIA, attributes)
+        assertTrue(volumes(media).isEmpty())
+
+        // Announcement ends and ramp starts
+        coordinator.onAnnouncementFrame(AudioChannel.NAVIGATION)
+        now = 205_000_000L
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(205))
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(50))
+        assertTrue(volumes(media).last() > 0.2f)
+
+        // Transient focus loss occurs (e.g. system alert or incoming call)
+        coordinator.listener.onAudioFocusChange(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+        assertEquals(0f, volumes(media).last(), 0.001f)
+
+        // Idle looper; volume should remain muted (0f)
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(200))
+        assertEquals(0f, volumes(media).last(), 0.001f)
+
+        // Focus gained back
+        coordinator.listener.onAudioFocusChange(AudioManager.AUDIOFOCUS_GAIN)
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(350))
+        assertEquals(1f, volumes(media).last(), 0.001f)
+    }
+
+    @Test fun coordinatorCloseDuringRampCancelsPendingRampAndDisablesCallbacks() {
+        var now = 0L
+        val coordinator = coordinator(announcementDuck = true, nowNs = { now })
+        val media = track()
+        coordinator.acquire(media, AudioChannel.MEDIA, attributes)
+        assertTrue(volumes(media).isEmpty())
+
+        coordinator.onAnnouncementFrame(AudioChannel.NAVIGATION)
+        now = 205_000_000L
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(205))
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(50))
+
+        val volBeforeClose = volumes(media).size
+        coordinator.close()
+
+        // Advance looper; no further volume changes should occur
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(400))
+        assertEquals(volBeforeClose, volumes(media).size)
+    }
+
+    private fun coordinator(
+        enabled: Boolean = true,
+        autoYield: Boolean = true,
+        announcementDuck: Boolean = false,
+        nowNs: () -> Long = System::nanoTime
+    ) = AudioFocusCoordinator(
+        context, enabled, autoYield,
+        announcementDuckEnabled = announcementDuck,
+        nowNs = nowNs
+    ).also(coordinators::add)
+
     private fun track(): AudioTrack = AudioTrack.Builder().setAudioAttributes(attributes)
         .setAudioFormat(AudioFormat.Builder().setSampleRate(44100).setEncoding(AudioFormat.ENCODING_PCM_16BIT)
             .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build())

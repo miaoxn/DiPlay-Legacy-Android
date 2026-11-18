@@ -145,6 +145,23 @@ class DiPlayActivity : ComponentActivity() {
     private val windowLearningPresses = WheelKeyPresses()
     private val endWindowLearning = Runnable { cancelKeyLearning() }
     private var page = "home"
+    // App theme, resolved from the theme setting + system night state at the start of
+    // every render(). The palette getters below are the single source of the settings
+    // UI colors; they used to be fixed dark constants in the companion object.
+    private var appTheme: SettingsTheme = SettingsTheme.CARD
+    private var appliedAppNight: Boolean? = null
+    private val BG get() = appTheme.background
+    private val SURFACE get() = appTheme.surface
+    // One step lighter than a card, so a button reads as a button even where its 1 px border is faint.
+    private val BUTTON get() = appTheme.button
+    private val BORDER get() = appTheme.border
+    private val ACCENT get() = appTheme.accent
+    private val RAIL_SELECTED get() = appTheme.railSelected
+    private val RAIL_SELECTED_BORDER get() = appTheme.railSelectedBorder
+    private val TEXT get() = appTheme.textPrimary
+    private val MUTED get() = appTheme.textSecondary
+    private val WARNING get() = appTheme.warning
+    private val READY get() = appTheme.ready
     private var settingsCategory = SettingsCategory.OVERVIEW
     private var connectionSettingsReturnCategory: SettingsCategory? = null
     private var settingsSectionFilter: Set<SettingsSection>? = null
@@ -429,11 +446,25 @@ class DiPlayActivity : ComponentActivity() {
         DiPlayBootstrap.restoreUsbBluetooth(this)
         // Returning from another activity can bring the head unit's own density back.
         if (enforceInterfaceSize()) render()
+        // Some head units change uiMode without delivering onConfigurationChanged:
+        // re-render when the resolved app theme changed while this activity was away.
+        val lastAppNight = appliedAppNight
+        if (lastAppNight != null && resolveAppNight(
+                AirPlayPersistence.loadAppThemeMode(this),
+                effectiveSystemNight(
+                    nightModeOrNull(resources.configuration.uiMode),
+                    AirPlayPersistence.loadAppThemeTimeWindow(this),
+                    window = AirPlayPersistence.loadAppThemeNightWindow(this),
+                ),
+                lastAppNight,
+            ) != lastAppNight
+        ) render()
         if (Build.VERSION.SDK_INT < 33 && AppLocale.preference(this) != languagePreferenceAtCreate) {
             recreate()
             return
         }
         handler.removeCallbacks(tick); handler.post(tick)
+        scheduleAppThemeBoundaryCheck()
         updater.onResume()
         // Back from the car settings: refresh the car hotspot reminder on the home page.
         if (!initialLaunch && !adbSwitchChangePending && !pausedForAdbSwitchChange &&
@@ -458,11 +489,13 @@ class DiPlayActivity : ComponentActivity() {
         cancelKeyLearning()
         pausedForAdbSwitchChange = adbSwitchChangePending
         handler.removeCallbacks(tick)
+        handler.removeCallbacks(appThemeBoundaryCheck)
         super.onPause()
     }
 
     override fun onDestroy() {
         handler.removeCallbacks(automaticUpdateCheck)
+        handler.removeCallbacks(appThemeBoundaryCheck)
         if (lazyUpdaterInitialized()) updater.close()
         hotspotJoinControls?.close()
         cancelUsbPermissionSetup()
@@ -503,8 +536,68 @@ class DiPlayActivity : ComponentActivity() {
             SettingsLayoutPolicy.isExpanded(it.screenWidthDp, it.screenHeightDp, it.fontScale)
         }
 
+    /**
+     * Fires at the next time-window boundary (06:00 / 18:30). Re-renders only
+     * when the resolved theme actually flipped; otherwise re-arms for the
+     * following boundary (the clock may have moved). Removed on pause and
+     * destroy, re-armed on resume and on every render.
+     */
+    private val appThemeBoundaryCheck = Runnable {
+        if (isDestroyed || isFinishing) return@Runnable
+        val next = resolveAppNight(
+            AirPlayPersistence.loadAppThemeMode(this),
+            effectiveSystemNight(
+                nightModeOrNull(resources.configuration.uiMode),
+                AirPlayPersistence.loadAppThemeTimeWindow(this),
+                window = AirPlayPersistence.loadAppThemeNightWindow(this),
+            ),
+            appliedAppNight ?: true,
+        )
+        if (next != appliedAppNight) render() else scheduleAppThemeBoundaryCheck()
+    }
+
+    /**
+     * Arms [appThemeBoundaryCheck] only when the time window can actually
+     * decide the theme: Follow-system mode with the window enabled. The
+     * reported state is deliberately not consulted: with the window on,
+     * the clock wins even on units that report a stuck night state, so
+     * the timer must fire at the boundaries regardless of the report.
+     */
+    private fun scheduleAppThemeBoundaryCheck() {
+        handler.removeCallbacks(appThemeBoundaryCheck)
+        if (AirPlayPersistence.loadAppThemeMode(this) != AppThemeMode.SYSTEM ||
+            !AirPlayPersistence.loadAppThemeTimeWindow(this)
+        ) return
+        val calendar = java.util.Calendar.getInstance()
+        handler.postDelayed(
+            appThemeBoundaryCheck,
+            millisUntilNextThemeBoundary(
+                calendar.get(java.util.Calendar.HOUR_OF_DAY) * 60 +
+                    calendar.get(java.util.Calendar.MINUTE),
+                calendar.get(java.util.Calendar.SECOND),
+                calendar.get(java.util.Calendar.MILLISECOND),
+                AirPlayPersistence.loadAppThemeNightWindow(this),
+            ),
+        )
+    }
+
     private fun render() {
         enforceInterfaceSize()
+        // Resolve the app theme before rebuilding: every color below reads appTheme.
+        appTheme = SettingsTheme.forSurface(
+            isOverlay = false,
+            night = resolveAppNight(
+                AirPlayPersistence.loadAppThemeMode(this),
+                effectiveSystemNight(
+                    nightModeOrNull(resources.configuration.uiMode),
+                    AirPlayPersistence.loadAppThemeTimeWindow(this),
+                    window = AirPlayPersistence.loadAppThemeNightWindow(this),
+                ),
+                appliedAppNight ?: true,
+            ),
+        )
+        appliedAppNight = appTheme.night
+        scheduleAppThemeBoundaryCheck()
         // A pending assignment belongs to the widgets being replaced, never to another page.
         cancelKeyLearning()
         // A restore still waiting for layout keeps its target: the old page was never laid out.
@@ -1083,6 +1176,14 @@ class DiPlayActivity : ComponentActivity() {
         })
     }
 
+    private fun appThemeLabels() = AppThemeMode.entries.map { mode ->
+        getString(when (mode) {
+            AppThemeMode.SYSTEM -> R.string.settings_app_theme_system
+            AppThemeMode.DARK -> R.string.settings_app_theme_dark
+            AppThemeMode.LIGHT -> R.string.settings_app_theme_light
+        })
+    }
+
     private fun appearanceControl(parent: LinearLayout) {
         val modes = CarPlayNightMode.entries
         choice(parent, getString(R.string.carplay_night_mode), nightModeLabels(),
@@ -1362,12 +1463,19 @@ class DiPlayActivity : ComponentActivity() {
             card.addView(button(getString(R.string.settings_bluetooth_diagnostic), false) {
                 openBluetoothDiagnostics()
             }, matchButton(10, 60))
+            // 硬件信息（IKT54J 建议 G）：把车机配置整理成一张可拍照/可复制的文本卡，
+            // 方便同车型车主横向对比硬件批次差异；不含任何设备唯一标识。
+            card.addView(button(getString(R.string.settings_hardware_info_title), false) {
+                showHardwareInfo()
+            }, matchButton(10, 60))
+            card.addView(label(getString(R.string.settings_hardware_info_subtitle), 14, MUTED).apply { setPadding(0, dp(4), 0, 0) })
             val destination = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) getString(R.string.reports_save_to_downloads_diplay) else getString(R.string.choose_where_to_save_your_report)
             card.addView(label(destination + getString(R.string.nothing_is_sent_automatically_protocol_payloads_and_creden), 14, MUTED).apply { setPadding(0, dp(12), 0, 0) })
         }
         filteredSection(content, SettingsSection.AUTOMATIC_CONNECTION,
             getString(R.string.automatic_connection), R.drawable.ic_dp_automation) { card ->
             toggle(card, getString(R.string.connect_when_diplay_opens), getString(R.string.default_connection_description), DiPlayPreferences.autoConnect(this)) { DiPlayPreferences.saveAutoConnect(this, it) }
+            toggle(card, getString(R.string.settings_usb_device_auto_launch), getString(R.string.settings_usb_device_auto_launch_description), DiPlayPreferences.usbDeviceAutoLaunch(this)) { DiPlayPreferences.saveUsbDeviceAutoLaunch(this, it) }
             val connectionModes = DefaultConnectionMode.entries
             choice(card, getString(R.string.default_connection_mode), listOf(
                 getString(R.string.default_connection_last_used),
@@ -1379,11 +1487,16 @@ class DiPlayActivity : ComponentActivity() {
             adbToggle(card, R.string.open_after_the_car_starts,
                 R.string.availability_depends_on_your_head_unit_s_startup_settings,
                 read = { AirPlayPersistence.loadAutoStartOnBoot(this) },
-                needsAdb = { CarHotspotSettings.enabled(this) &&
-                    AirPlayPersistence.loadWirelessHotspotMode(this) == WirelessHotspotMode.MANUAL },
+                needsAdb = { CarHotspotSetup.bootLaunchNeedsAdb(this) },
                 permissions = { listOf(CarHotspotSetup.Permission.BOOT_LAUNCH) }) {
                 AirPlayPersistence.saveAutoStartOnBoot(this, it)
             }
+            toggle(
+                card,
+                getString(R.string.settings_wifi_foreground_trigger_title),
+                getString(R.string.settings_wifi_foreground_trigger_description),
+                AirPlayPersistence.loadWifiForegroundTrigger(this),
+            ) { AirPlayPersistence.saveWifiForegroundTrigger(this, it) }
             val autoConfirmActive = UsbPermissionSetup.Permission.ACCESSIBILITY.granted(this)
             toggle(
                 card,
@@ -1454,6 +1567,32 @@ class DiPlayActivity : ComponentActivity() {
             scheduleTimeControl(scheduleControls, start = true)
             scheduleTimeControl(scheduleControls, start = false)
             card.addView(scheduleControls)
+            val appThemeModes = AppThemeMode.entries
+            choice(
+                card,
+                getString(R.string.settings_app_theme),
+                appThemeLabels(),
+                appThemeModes.indexOf(AirPlayPersistence.loadAppThemeMode(this)),
+                reconnects = false,
+            ) { index ->
+                AirPlayPersistence.saveAppThemeMode(this, appThemeModes[index])
+                render()
+            }
+            card.addView(label(getString(R.string.settings_app_theme_description), 14, MUTED).apply {
+                setPadding(0, 0, 0, dp(18))
+            })
+            val timeWindowEnabled = AirPlayPersistence.loadAppThemeTimeWindow(this)
+            toggle(card, getString(R.string.settings_app_theme_time_window), getString(R.string.settings_app_theme_time_window_description),
+                timeWindowEnabled) { enabled ->
+                AirPlayPersistence.saveAppThemeTimeWindow(this, enabled)
+                render()
+            }
+            val timeWindowControls = column().apply {
+                visibility = if (timeWindowEnabled) View.VISIBLE else View.GONE
+            }
+            themeWindowTimeControl(timeWindowControls, start = true)
+            themeWindowTimeControl(timeWindowControls, start = false)
+            card.addView(timeWindowControls)
             card.addView(button(getString(R.string.picture_adjustments), false) {
                 startActivity(Intent(this, CarPlayHostActivity::class.java)
                     .putExtra("picture_controls", true).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
@@ -1509,6 +1648,17 @@ class DiPlayActivity : ComponentActivity() {
                 AirPlayPersistence.loadHarmanFullscreen(this)) { enabled ->
                 AirPlayPersistence.saveHarmanFullscreen(this, enabled)
             }
+            // Issue #363: on launchers that keep a dock bar over the
+            // picture, the reporter proved that bringing the app task to
+            // the front drops the bar without any desktop round-trip. When
+            // this is on, the host re-fronts its own task when it detects
+            // the squeeze. Applies at the next connection.
+            toggle(card, getString(R.string.settings_dock_bar_refront),
+                getString(R.string.settings_dock_bar_refront_description),
+                AirPlayPersistence.loadDockBarRefront(this)) {
+                AirPlayPersistence.saveDockBarRefront(this, it)
+                markReconnectNeeded()
+            }
             toggle(card, getString(R.string.split_screen_areas), getString(R.string.split_screen_areas_description),
                 SplitScreenSettings.enabled(this)) {
                 SplitScreenSettings.setEnabled(this, it)
@@ -1523,6 +1673,11 @@ class DiPlayActivity : ComponentActivity() {
             toggle(card, getString(R.string.side_panel), getString(R.string.side_panel_description), SidePanelSettings.enabled(this)) {
                 SidePanelSettings.setEnabled(this, it)
                 markReconnectNeeded()
+            }
+            toggle(card, getString(R.string.settings_legacy_reverse_cold_start),
+                getString(R.string.settings_legacy_reverse_cold_start_description),
+                AirPlayPersistence.loadLegacyReverseColdStart(this)) { enabled ->
+                AirPlayPersistence.saveLegacyReverseColdStart(this, enabled)
             }
             if (CarPlayRotation.enabled(this)) {
                 val pictures = CarPlayRotation.Picture.entries
@@ -1609,6 +1764,11 @@ class DiPlayActivity : ComponentActivity() {
                     reconnectIfRunning()
                 }
             }
+            toggle(card, getString(R.string.settings_bluetooth_music_auto_open), getString(R.string.settings_bluetooth_music_auto_open_description),
+                AirPlayPersistence.loadBluetoothMusicAutoOpen(this)) {
+                AirPlayPersistence.saveBluetoothMusicAutoOpen(this, it)
+                markReconnectNeeded()
+            }
         }
         // Firmware-specific opt-ins that change how the wired link itself is established.
         filteredSection(content, SettingsSection.ADVANCED_CONNECTION,
@@ -1627,6 +1787,50 @@ class DiPlayActivity : ComponentActivity() {
                 getString(R.string.settings_root_hotspot_mode_description),
                 AirPlayPersistence.loadRootHotspotEnabled(this)) {
                 AirPlayPersistence.saveRootHotspotEnabled(this, it)
+                markReconnectNeeded()
+            }
+            // Issue #344: Apple vendor IE on the root hostapd beacon — iPhones
+            // never auto-join an AP without it (a manual tap connects fine,
+            // which proves the rest of the chain). Only affects Root hotspot
+            // mode; applies at the next connection.
+            toggle(card, getString(R.string.settings_hostapd_apple_vendor_ie),
+                getString(R.string.settings_hostapd_apple_vendor_ie_description),
+                AirPlayPersistence.loadHostapdAppleVendorIe(this)) {
+                AirPlayPersistence.saveHostapdAppleVendorIe(this, it)
+                markReconnectNeeded()
+            }
+            // Issue #343: after wireless CarPlay connects, the phone's native
+            // Bluetooth call screen keeps popping up next to the CarPlay call
+            // screen. This switch turns the head unit Bluetooth off once the
+            // session is fully on Wi-Fi (tunnel handoff done), which drops the
+            // native Bluetooth link; Bluetooth is turned back on when the
+            // session ends. Wireless only; applies at the next connection.
+            toggle(card, getString(R.string.settings_carplay_auto_disconnect_bt),
+                getString(R.string.settings_carplay_auto_disconnect_bt_description),
+                AirPlayPersistence.loadCarplayAutoDisconnectBt(this)) {
+                AirPlayPersistence.saveCarplayAutoDisconnectBt(this, it)
+                markReconnectNeeded()
+            }
+            // Issue #343-Q1: when the call downlink is silent on the telephony stream
+            // while media audio works, route just the downlink through the music stream.
+            // Call mode and the microphone uplink stay unchanged; applies at the next
+            // connection, and only affects the telephony stream type and usage.
+            toggle(card, getString(R.string.settings_telephony_downlink_via_music),
+                getString(R.string.settings_telephony_downlink_via_music_description),
+                AirPlayPersistence.loadTelephonyDownlinkViaMusic(this)) {
+                AirPlayPersistence.saveTelephonyDownlinkViaMusic(this, it)
+                markReconnectNeeded()
+            }
+            // Issue #364: some phones/head units never duck media for a
+            // navigation prompt, an assistant reply or a call, so the prompt
+            // fights the music at full volume. When this is on, frame
+            // activity on an announcement channel ducks the media
+            // renderer's gain inside the app and restores it shortly after
+            // the announcement ends. Applies at the next connection.
+            toggle(card, getString(R.string.settings_announcement_duck_media),
+                getString(R.string.settings_announcement_duck_media_description),
+                AirPlayPersistence.loadAnnouncementDuckMedia(this)) {
+                AirPlayPersistence.saveAnnouncementDuckMedia(this, it)
                 markReconnectNeeded()
             }
         }
@@ -1928,6 +2132,26 @@ class DiPlayActivity : ComponentActivity() {
 
     private fun bydAdbSettings(parent: LinearLayout) {
         if (AirPlayPersistence.loadWirelessHotspotMode(this) != WirelessHotspotMode.MANUAL) return
+        if (CarHotspotSetup.isDirectHotspotSupported(this)) {
+            val title = if (CarHotspotSetup.isLegacyEcarxHeadUnit(this)) {
+                getString(R.string.settings_ecarx_hotspot_title)
+            } else {
+                getString(R.string.settings_legacy_hotspot_title)
+            }
+            val desc = if (CarHotspotSetup.isLegacyEcarxHeadUnit(this)) {
+                getString(R.string.settings_ecarx_hotspot_description)
+            } else {
+                getString(R.string.settings_legacy_hotspot_description)
+            }
+            filteredSection(parent, SettingsSection.BYD_ADB, title, R.drawable.ic_dp_permissions) { card ->
+                toggle(card, getString(R.string.auto_car_hotspot_title), desc, CarHotspotSettings.enabled(this)) {
+                    CarHotspotSettings.setEnabled(this, it)
+                    if (!it) startupHotspotCancelled = true
+                    markReconnectNeeded()
+                }
+            }
+            return
+        }
         if (!CarHotspotSetup.isBydHeadUnit(this)) {
             Log.i("DiPlay-Hotspot", "settings hidden: BYD head unit not detected")
             return
@@ -4168,6 +4392,32 @@ class DiPlayActivity : ComponentActivity() {
         parent.addView(space(12))
     }
 
+    private fun themeWindowTimeControl(parent: LinearLayout, start: Boolean) {
+        val title = getString(if (start) R.string.settings_app_theme_night_start else R.string.settings_app_theme_night_end)
+        fun labelFor(minute: Int) = "$title · ${String.format(Locale.getDefault(), "%02d:%02d", minute / 60, minute % 60)}"
+        val initial = AirPlayPersistence.loadAppThemeNightWindow(this)
+        val control = button(labelFor(if (start) initial.startMinute else initial.endMinute), false) {}
+        control.setOnClickListener {
+            val current = AirPlayPersistence.loadAppThemeNightWindow(this)
+            val selected = if (start) current.startMinute else current.endMinute
+            TimePickerDialog(this, { _, hour, minute ->
+                val updatedMinute = hour * 60 + minute
+                val other = if (start) current.endMinute else current.startMinute
+                if (updatedMinute == other) {
+                    toast(getString(R.string.carplay_night_schedule_same_time))
+                } else {
+                    val updated = if (start) current.copy(startMinute = updatedMinute)
+                        else current.copy(endMinute = updatedMinute)
+                    AirPlayPersistence.saveAppThemeNightWindow(this, updated)
+                    control.text = labelFor(updatedMinute)
+                    render()
+                }
+            }, selected / 60, selected % 60, true).show()
+        }
+        parent.addView(control, matchButton(0, 60))
+        parent.addView(space(12))
+    }
+
     private fun connect(wireless: Boolean) {
         startupHotspotCancelled = true
         if (wireless && pendingCarHotspotSetup) { toast(getString(R.string.save_your_hotspot_details_in_connection_setup_first)); page = "connection"; render(); return }
@@ -4230,11 +4480,7 @@ class DiPlayActivity : ComponentActivity() {
             val devices = fetchSystemBluetoothDevices(adapter)
             runOnUiThread {
                 if (isFinishing || (Build.VERSION.SDK_INT >= 17 && isDestroyed)) return@runOnUiThread
-                if (devices.isNotEmpty()) {
-                    showChoosePhoneDialog(devices)
-                } else {
-                    promptManualBluetoothInput()
-                }
+                showChoosePhoneDialog(devices)
             }
         }
     }
@@ -4343,25 +4589,99 @@ class DiPlayActivity : ComponentActivity() {
     }
 
     private fun showChoosePhoneDialog(devices: List<DiscoveredBluetoothDevice>) {
-        val items = devices.map { device ->
-            val status = if (device.isConnected) " · ${getString(R.string.bluetooth_device_connected)}" else ""
-            val duplicate = devices.count { it.name == device.name } > 1
-            val disambiguation = if (duplicate) " (${device.address.takeLast(5)})" else ""
-            "${device.name}$disambiguation$status"
-        }.toTypedArray()
+        val knownPhones = DiPlayPreferences.knownPhones(this)
+        val knownAddresses = knownPhones.map { it.address.uppercase(java.util.Locale.US) }.toSet()
+        val newDiscovered = devices.filterNot { it.address.uppercase(java.util.Locale.US) in knownAddresses }
 
+        data class DialogEntry(
+            val label: String,
+            val known: com.shilapi.xcertplay.bluetooth.KnownPhone?,
+            val discovered: DiscoveredBluetoothDevice?,
+        )
+
+        val entries = mutableListOf<DialogEntry>()
+        for ((idx, phone) in knownPhones.withIndex()) {
+            val match = devices.firstOrNull { it.address.equals(phone.address, ignoreCase = true) }
+            val status = if (match?.isConnected == true) " · ${getString(R.string.bluetooth_device_connected)}" else ""
+            val prefix = if (idx == 0) "★ " else "   "
+            val aliasSuffix = if (phone.alias != null) " (${phone.name})" else ""
+            val text = "$prefix${phone.displayName()}$aliasSuffix (${phone.address.takeLast(5)})$status"
+            entries.add(DialogEntry(text, phone, match))
+        }
+        for (dev in newDiscovered) {
+            val status = if (dev.isConnected) " · ${getString(R.string.bluetooth_device_connected)}" else ""
+            val text = "[+] ${dev.name} (${dev.address.takeLast(5)})$status"
+            entries.add(DialogEntry(text, null, dev))
+        }
+
+        if (entries.isEmpty()) {
+            promptManualBluetoothInput()
+            return
+        }
+
+        val items = entries.map { it.label }.toTypedArray()
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.choose_your_iphone))
             .setItems(items) { _, index ->
-                val device = devices[index]
-                DiPlayPreferences.savePhone(this, device.address, device.name)
-                val start = pendingWireless
-                pendingWireless = false
-                render()
-                if (start) connect(true)
+                val entry = entries[index]
+                if (entry.known != null) {
+                    showManageKnownPhoneDialog(entry.known)
+                } else if (entry.discovered != null) {
+                    DiPlayPreferences.savePhone(this, entry.discovered.address, entry.discovered.name)
+                    val start = pendingWireless
+                    pendingWireless = false
+                    render()
+                    if (start) connect(true)
+                }
             }
             .setNeutralButton(getString(R.string.manual_input_mac)) { _, _ -> promptManualBluetoothInput() }
             .setNegativeButton(getString(R.string.cancel)) { _, _ -> pendingWireless = false }
+            .show()
+    }
+
+    private fun showManageKnownPhoneDialog(phone: com.shilapi.xcertplay.bluetooth.KnownPhone) {
+        val options = arrayOf(
+            getString(R.string.settings_phone_connect_action),
+            getString(R.string.settings_rename_phone),
+            getString(R.string.settings_delete_phone),
+        )
+        AlertDialog.Builder(this)
+            .setTitle(phone.displayName())
+            .setItems(options) { _, optionIndex ->
+                when (optionIndex) {
+                    0 -> {
+                        DiPlayPreferences.selectPrimaryPhone(this, phone.address)
+                        val start = pendingWireless
+                        pendingWireless = false
+                        render()
+                        if (start) connect(true)
+                    }
+                    1 -> promptRenamePhone(phone)
+                    2 -> {
+                        DiPlayPreferences.removeKnownPhone(this, phone.address)
+                        render()
+                    }
+                }
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
+            .show()
+    }
+
+    private fun promptRenamePhone(phone: com.shilapi.xcertplay.bluetooth.KnownPhone) {
+        val input = EditText(this).apply {
+            hint = getString(R.string.settings_phone_alias_hint)
+            setText(phone.alias ?: "")
+            setSingleLine()
+        }
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.settings_rename_phone))
+            .setView(input)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                val newAlias = input.text.toString().trim()
+                DiPlayPreferences.updatePhoneAlias(this, phone.address, newAlias)
+                render()
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
             .show()
     }
 
@@ -4455,27 +4775,28 @@ class DiPlayActivity : ComponentActivity() {
         val appContext = applicationContext
         val usbDongle = CarPlayBluetoothManager.get(appContext).usbDongle
 
-        card.addView(label(getString(R.string.settings_usb_bluetooth_subtitle), 14, MUTED))
-
         val statusLabel = label("", 15, TEXT).apply {
             setPadding(0, dp(8), 0, dp(4))
         }
-        card.addView(statusLabel)
-
         val actionLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
-        card.addView(actionLayout)
 
         fun refreshCard() {
             if (isFinishing || isDestroyed) return
             actionLayout.removeAllViews()
+            val currentSource = AirPlayPersistence.loadBluetoothSource(this)
             val status = usbDongle?.getStatus()
             val dev = status?.device
             val isSupported = status?.isSupported == true
             val hasPerm = status?.hasPermission == true
             val isEnabled = status?.isEnabled == true
             val bdAddr = status?.localBdAddr
+
+            if (currentSource == com.shilapi.xcertplay.bluetooth.BluetoothSource.BUILTIN) {
+                statusLabel.text = "${getString(R.string.settings_bluetooth_source_title)}: ${getString(R.string.settings_bluetooth_source_builtin)}"
+                return
+            }
 
             if (!isSupported || dev == null) {
                 statusLabel.text = getString(R.string.settings_usb_bluetooth_not_detected)
@@ -4532,8 +4853,33 @@ class DiPlayActivity : ComponentActivity() {
                     actionLayout.addView(startBtn, matchButton(8, 60))
                 }
             }
-
         }
+
+        val sources = com.shilapi.xcertplay.bluetooth.BluetoothSource.entries
+        val sourceTitles = listOf(
+            getString(R.string.settings_bluetooth_source_auto),
+            getString(R.string.settings_bluetooth_source_builtin),
+            getString(R.string.settings_bluetooth_source_usb_dongle),
+        )
+        choice(
+            card,
+            getString(R.string.settings_bluetooth_source_title),
+            sourceTitles,
+            sources.indexOf(AirPlayPersistence.loadBluetoothSource(this)),
+            reconnects = true,
+        ) { index ->
+            AirPlayPersistence.saveBluetoothSource(this, sources[index])
+            CarPlayBluetoothManager.sourceModeProvider = { sources[index] }
+            markReconnectNeeded()
+            refreshCard()
+        }
+        card.addView(label(getString(R.string.settings_bluetooth_source_description), 14, MUTED).apply {
+            setPadding(0, dp(4), 0, dp(8))
+        })
+
+        card.addView(label(getString(R.string.settings_usb_bluetooth_subtitle), 14, MUTED))
+        card.addView(statusLabel)
+        card.addView(actionLayout)
 
         refreshCard()
         val refresh = object : Runnable {
@@ -4720,6 +5066,7 @@ class DiPlayActivity : ComponentActivity() {
         appendLine("Saved resolution preference (may differ from active session): ${AirPlayPersistence.loadDisplayScalePercent(appContext)}%")
         appendLine("Session: ${if (CarPlayBackgroundSession.active) "active" else if (CarPlayBackgroundSession.hasSession()) "connecting" else "stopped"}")
         appendLine("Head-unit board: ${Build.BOARD}; hardware: ${Build.HARDWARE}; build: ${Build.DISPLAY}")
+        appendLine(HardwareInfoReport.summaryLine(appContext))
         appendLine()
         appendLine("--- Current cluster display diagnostics (even when disabled) ---")
         appendLine(ClusterMapPresentation.diagnosticReport(appContext))
@@ -4764,6 +5111,7 @@ class DiPlayActivity : ComponentActivity() {
         appendLine()
         appendLine("--- Last received boot and app-launch result ---")
         appendLine(StartupDiagnosticSnapshot.report(appContext))
+        appendLine("Experimental display: dockBarRefront=${AirPlayPersistence.loadDockBarRefront(appContext)}")
         appendLine("Startup settings: openAfterBoot=${AirPlayPersistence.loadAutoStartOnBoot(appContext)} " +
             "connectWhenOpened=${DiPlayPreferences.autoConnect(appContext)}")
         appendLine()
@@ -4873,6 +5221,34 @@ class DiPlayActivity : ComponentActivity() {
     }.getOrElse { error ->
         Log.w("DiPlay", "clipboard copy failed", error)
         false
+    }
+
+    /** IKT54J suggestion G: the hardware card — big monospace text the owner
+     * can photograph for a group chat, plus a copy button for pasting it as
+     * text. Deliberately identifier-free (see HardwareInfoReport). */
+    private fun showHardwareInfo() {
+        val text = HardwareInfoReport.fullText(this)
+        val body = column().apply { setPadding(dp(24), dp(12), dp(24), dp(12)) }
+        body.addView(label(getString(R.string.settings_hardware_info_hint), 14, MUTED))
+        body.addView(button(getString(R.string.copy_all), false) {
+            if (copyToClipboard(getString(R.string.settings_hardware_info_title), text)) {
+                toast(getString(R.string.diagnostic_report_copied))
+            } else {
+                toast(getString(R.string.clipboard_copy_failed))
+            }
+        })
+        body.addView(label(text, 15, TEXT).apply {
+            typeface = Typeface.MONOSPACE
+            setPadding(0, dp(10), 0, 0)
+        })
+        runCatching {
+            AlertDialog.Builder(this).setTitle(getString(R.string.settings_hardware_info_title))
+                .setView(ScrollView(this).apply { addView(body) })
+                .setPositiveButton(getString(R.string.close), null).show()
+        }.onFailure { error ->
+            Log.w("DiPlay", "hardware info dialog failed", error)
+            toast(getString(R.string.diagnostic_report_preview_unavailable))
+        }
     }
 
     private fun showDiagnosticReport(report: String) {
@@ -5049,6 +5425,12 @@ class DiPlayActivity : ComponentActivity() {
             AirPlayPersistence.loadAudioFocusAutoYield(this)) {
             AirPlayPersistence.saveAudioFocusAutoYield(this, it)
         }
+        toggle(dependent, getString(R.string.settings_media_focus_exclusive),
+            getString(R.string.settings_media_focus_exclusive_description),
+            AirPlayPersistence.loadMediaFocusExclusive(this)) {
+            AirPlayPersistence.saveMediaFocusExclusive(this, it)
+            markReconnectNeeded()
+        }
         parent.addView(dependent)
     }
 
@@ -5090,7 +5472,7 @@ class DiPlayActivity : ComponentActivity() {
             label = title,
             description = description,
             checked = value,
-            theme = SettingsTheme.CARD,
+            theme = appTheme,
             contentDescription = title,
             enabled = enabled,
             onChanged = save,
@@ -5150,7 +5532,8 @@ class DiPlayActivity : ComponentActivity() {
      * start-aligned, muted value, chevron. Any other text stays a centred action button.
      * The plain text is unchanged, so callers and tests keep matching "Title · Value".
      */
-    private class SettingButton(context: android.content.Context) : Button(context) {
+    // Inner so the row reads the activity's resolved theme (MUTED/ACCENT) at setText time.
+    private inner class SettingButton(context: android.content.Context) : Button(context) {
         var action = false
 
         override fun setText(text: CharSequence?, type: BufferType?) {
@@ -5257,18 +5640,6 @@ class DiPlayActivity : ComponentActivity() {
         private const val ADB_KEY_SAVE_WAIT_MILLIS = 500L
         /** In-app report preview cap: weak head units cannot lay out a huge TextView. */
         private const val REPORT_PREVIEW_CHARS = 100 * 1024
-        private val BG = Color.rgb(12, 17, 27)
-        private val SURFACE = Color.rgb(21, 30, 44)
-        // One step lighter than a card, so a button reads as a button even where its 1 px border is faint.
-        private val BUTTON = Color.rgb(31, 43, 61)
-        private val BORDER = Color.rgb(42, 56, 75)
-        private val ACCENT = com.shilapi.xcertplay.settings.SettingsTheme.CARD.accent
-        private val RAIL_SELECTED = Color.rgb(24, 54, 92)
-        private val RAIL_SELECTED_BORDER = Color.rgb(42, 82, 130)
-        private val TEXT = com.shilapi.xcertplay.settings.SettingsTheme.CARD.textPrimary
-        private val MUTED = com.shilapi.xcertplay.settings.SettingsTheme.CARD.textSecondary
-        private val WARNING = Color.rgb(255, 196, 128)
-        private val READY = Color.rgb(127, 205, 154)
         private const val RIPPLE = 0x336F9FD9
         private const val VALUE_SEPARATOR = " · "
         private const val SEARCH_HIGHLIGHT_MILLIS = 900L

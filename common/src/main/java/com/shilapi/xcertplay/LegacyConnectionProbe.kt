@@ -44,7 +44,8 @@ internal object LegacyConnectionProbe {
             val hybrid = com.shilapi.xcertplay.bluetooth.CarPlayBluetoothManager.get(context)
             "Bluetooth adapter=${bluetooth != null} enabled=${bluetooth?.isEnabled} " +
                 "hybridSupported=${hybrid.isSupported()} hybridEnabled=${hybrid.isEnabled()} " +
-                "hybridAdapter=${hybrid.getAdapterName()}"
+                "hybridAdapter=${hybrid.getAdapterName()} " +
+                "hsaeService=${hybrid.hsae.hasHsaeService()} anwPhoneLink=${hybrid.hsae.hasAnwPhoneLink()}"
         }.getOrElse { "Bluetooth probe failed=${it.javaClass.simpleName}" })
         appendLine(runCatching {
             val usb = context.applicationContext.getSystemService(Context.USB_SERVICE) as? UsbManager

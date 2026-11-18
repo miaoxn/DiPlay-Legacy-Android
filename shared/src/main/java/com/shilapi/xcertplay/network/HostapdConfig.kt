@@ -21,9 +21,22 @@ object HostapdConfig {
     const val MIN_CHANNEL = 1
     const val MAX_CHANNEL = 13
 
+    /**
+     * Issue #344: Apple vendor IE for the 2.4 GHz beacon, so iPhones auto-join
+     * the AP instead of waiting for a manual tap. The 5 GHz bytes (…0021) are
+     * the ones verified in docs/WIRELESS_HOTSPOT_JOIN.md; this backend is
+     * 2.4 GHz-only (hw_mode=g), and the 2.4 GHz tail byte (…0022) follows the
+     * reporter's LIVI citation — on-device verification still awaited, which
+     * is why this stays behind an experimental toggle.
+     */
+    const val APPLE_VENDOR_IE_2G = "dd0800a0400000020022"
+
     const val CONF_PATH = "/data/misc/wifi/hostapd.conf"
     const val TMP_CONF_PATH = "/data/local/tmp/hostapd_full.conf"
     const val HOSTAPD_LOG_PATH = "/data/local/tmp/hapd.log"
+    // Issue #337: foreground-probe log, kept apart from hapd.log so the
+    // probe never clobbers the daemon-launch evidence it investigates.
+    const val FG_PROBE_LOG_PATH = "/data/local/tmp/hapd-fg.log"
     const val DNSMASQ_LOG_PATH = "/data/local/tmp/dns.log"
     const val LEASES_PATH = "/data/local/tmp/dnsmasq.leases"
     const val DNSMASQ_PID_PATH = "/data/local/tmp/dnsmasq.pid"
@@ -34,14 +47,29 @@ object HostapdConfig {
         // The manual-hotspot validation allows an open network; hostapd WPA2
         // mode is the only configuration this backend offers.
         if (passphrase.isEmpty()) return "The hostapd hotspot password must be 8–63 characters"
+        // Both values are written verbatim into a config file that hostapd
+        // reads as root: one line per directive. A line break would let the
+        // value smuggle in further directives, so no control character is
+        // accepted (hostapd itself rejects them in wpa_passphrase as well).
+        if (hasControlCharacter(ssid) || hasControlCharacter(passphrase)) {
+            return "The hostapd hotspot name or password contains a control character"
+        }
+        // hostapd counts the passphrase in bytes, not characters.
+        if (passphrase.encodeToByteArray().size !in 8..63) {
+            return "The hostapd hotspot password must be 8–63 bytes"
+        }
         if (channel !in MIN_CHANNEL..MAX_CHANNEL) {
             return "hostapd channel must be $MIN_CHANNEL..$MAX_CHANNEL (2.4 GHz)"
         }
         return null
     }
 
+    /** True for ASCII control characters, which includes CR, LF and DEL (hostapd's own test). */
+    fun hasControlCharacter(value: String): Boolean =
+        value.any { it < ' ' || it == '\u007f' }
+
     /** The hostapd configuration file body for the generated AP. */
-    fun renderConf(ssid: String, passphrase: String, channel: Int): String = buildString {
+    fun renderConf(ssid: String, passphrase: String, channel: Int, appleVendorIe: Boolean = false): String = buildString {
         append("interface=").append(INTERFACE_NAME).append('\n')
         append("driver=nl80211\n")
         append("ssid=").append(ssid).append('\n')
@@ -54,6 +82,9 @@ object HostapdConfig {
         append("wpa_key_mgmt=WPA-PSK\n")
         append("rsn_pairwise=CCMP\n")
         append("max_num_sta=8\n")
+        // Issue #344: without this element iPhones never auto-join the AP
+        // (a manual tap connects fine, which proves the rest of the chain).
+        if (appleVendorIe) append("vendor_elements=").append(APPLE_VENDOR_IE_2G).append('\n')
     }
 
     /** Directories searched for the hostapd/dnsmasq binaries, in order. */
@@ -107,11 +138,74 @@ object HostapdConfig {
             "--dhcp-option=3,$HOST_ADDRESS --dhcp-option=6,$HOST_ADDRESS " +
             ">$DNSMASQ_LOG_PATH 2>&1 &"
 
-    /** Kills leftover hostapd/dnsmasq from an earlier run and clears stale lease state. */
+    /**
+     * Kills leftover hostapd/dnsmasq from an earlier run and clears stale lease state.
+     *
+     * A process is killed only when one of its `ps` fields is exactly the
+     * binary name (or a path ending in it). The earlier `grep -E "hostapd"`
+     * matched any line that merely contained the word, so an unrelated process
+     * (an app package, a helper script, `su` running a hostapd command) could
+     * be killed with `kill -9`. The PID is taken from column 2, as on Android's
+     * toolbox/toybox `ps`; anything that is not all digits is skipped.
+     * `set -f` stops `[kworker/...]`-style names from being glob-expanded.
+     */
     fun killStaleScript(): String =
-        "for name in hostapd dnsmasq; do ps | grep -E \"\$name\" | grep -v grep | " +
-            "while read line; do set -- \$line; kill -9 \$2 2>/dev/null; done; done; sleep 1; " +
+        "set -f; for name in hostapd dnsmasq; do ps | while read line; do set -- \$line; hit=0; " +
+            "for f in \"\$@\"; do [ \"\${f##*/}\" = \"\$name\" ] && hit=1; done; " +
+            "[ \$hit = 1 ] || continue; case \"\$2\" in ''|*[!0-9]*) continue;; esac; " +
+            "kill -9 \$2 2>/dev/null; done; done; sleep 1; " +
             "rm -f $LEASES_PATH $DNSMASQ_PID_PATH"
+
+    /**
+     * Removes the generated configuration, which holds the WPA passphrase, plus
+     * the logs and lease state of this backend. [TMP_CONF_PATH] sits in the
+     * shell-readable /data/local/tmp, so it is also removed as soon as it has
+     * been copied to [CONF_PATH].
+     */
+    fun removeGeneratedFilesScript(): String =
+        "rm -f $CONF_PATH $TMP_CONF_PATH $HOSTAPD_LOG_PATH $DNSMASQ_LOG_PATH $LEASES_PATH $DNSMASQ_PID_PATH"
+
+    /** Removes only the shell-readable staging copy of the configuration. */
+    fun removeStagedConfScript(): String = "rm -f $TMP_CONF_PATH"
+
+    /**
+     * Issue #337: the hostapd launch echoes the daemon's pid (`echo $!`), so
+     * a later failure can tell whether THIS hostapd died, was killed, or was
+     * never started — instead of only knowing that no hostapd-shaped process
+     * matched `ps`. Parses the first all-digits line of the launch shell's
+     * merged output; anything else (exec errors, blank lines) is ignored.
+     */
+    fun parseLaunchedPid(launchOutput: String): Int? =
+        launchOutput.lineSequence().map { it.trim() }
+            .firstOrNull { it.isNotEmpty() && it.all { c -> c.isDigit() } }
+            ?.toIntOrNull()
+
+    /**
+     * Issue #337: the `ps` line for one pid, if present. Android
+     * toolbox/toybox `ps` puts the pid in column 2, busybox in column 1 —
+     * accept either, so a missing line means the process is gone, not that
+     * the dialect differs. Field equality (not substring) avoids matching
+     * pid 123 against pid 1234. Returns the trimmed line, or null.
+     */
+    fun psLineForPid(psOutput: String, pid: Int): String? {
+        val want = pid.toString()
+        return psOutput.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }
+            .firstOrNull { line ->
+                val fields = line.split(Regex("\\s+"))
+                fields.getOrNull(0) == want || fields.getOrNull(1) == want
+            }
+    }
+
+    /**
+     * Counts active hostapd processes in `ps` output without depending on `grep`, `wc`, or `tail`.
+     * Minimal ROMs (e.g. Android 4.2 toolbox, issues #308, #337) lack these shell utilities.
+     */
+    fun countHostapdProcesses(psOutput: String): Int =
+        psOutput.lineSequence().count { line ->
+            val words = line.trim().split(Regex("\\s+"))
+            words.any { it == "hostapd" || it.endsWith("/hostapd") } &&
+                !words.any { it.contains("grep") }
+        }
 
     /** One dnsmasq lease line: `<expiry epoch> <mac> <ip> <hostname> <client id>`. */
     data class Lease(val expiryEpochSeconds: Long, val macAddress: String, val ipAddress: String)

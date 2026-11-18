@@ -51,6 +51,10 @@ internal class AudioFocusCoordinator(
     private val muteMediaOnTransientLoss: Boolean = true,
     private val report: (String) -> Unit = {},
     private val nowNs: () -> Long = System::nanoTime,
+    /** Issue #290: true requests AUDIOFOCUS_GAIN for media; false keeps MAY_DUCK. */
+    private val mediaFocusExclusive: Boolean = false,
+    /** Issue #364: duck media on announcement frame activity (experimental). */
+    private val announcementDuckEnabled: Boolean = false,
 ) {
     private data class Entry(val channel: AudioChannel, val attributes: Any?, var appliedVolume: Float = FULL_VOLUME)
 
@@ -59,6 +63,14 @@ internal class AudioFocusCoordinator(
     private var request: Any? = null
     private var requestedChannel: AudioChannel? = null
     private var mediaVolume = FULL_VOLUME
+    /** Issue #364: the volume the focus side last asked for, before the
+     * announcement duck is composed in; [mediaVolume] stays the effective one. */
+    private var focusVolume = FULL_VOLUME
+    private var announcementDucking = false
+    private var announcementChannel: AudioChannel? = null
+    /** Wall clock of the last announcement-channel PCM write; only read by the release check. */
+    @Volatile private var lastAnnouncementNanos = 0L
+    @Volatile private var announcementTimerArmed = false
     private var closed = false
     private var focusGeneration = 0L
     private var currentListener = listenerFor(focusGeneration)
@@ -102,15 +114,15 @@ internal class AudioFocusCoordinator(
             }
             runCatching { report("Audio: focus change=$change activeTracks=${active.size}") }
             when (change) {
-                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> setMediaVolume(DUCKED_VOLUME)
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> setFocusVolume(DUCKED_VOLUME)
                 AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
                     if (muteMediaOnTransientLoss) {
                         // This reports a temporary Android focus owner, not a confirmed call.
                         Log.i(TAG, "Audio: muting media during transient focus loss")
-                        setMediaVolume(0f)
+                        setFocusVolume(0f)
                     }
                 }
-                AudioManager.AUDIOFOCUS_GAIN -> setMediaVolume(FULL_VOLUME)
+                AudioManager.AUDIOFOCUS_GAIN -> setFocusVolume(FULL_VOLUME)
                 // Keep CarPlay audio running on permanent loss. Some head units
                 // do not send a later gain callback after taking focus back.
             }
@@ -119,7 +131,12 @@ internal class AudioFocusCoordinator(
 
     @Synchronized
     fun acquire(track: AudioTrack, channel: AudioChannel, attributes: Any?) {
-        if (closed || !enabled || manager == null) return
+        // Issue #364: the announcement duck needs the per-track volume
+        // bookkeeping even when system focus requests are off, so track
+        // registration also runs for the duck alone; refreshRequest() itself
+        // stays gated on the focus setting and issues no request then.
+        if (closed || manager == null) return
+        if (!enabled && !announcementDuckEnabled) return
         active[track] = Entry(channel, attributes)
         // Issue #214: navigation alone gets no sound on some head units because the audio
         // output stays muted without focus. Let a lone navigation track take focus to open
@@ -148,14 +165,21 @@ internal class AudioFocusCoordinator(
     fun close() {
         if (closed) return
         closed = true
+        cancelRampLocked()
         active.clear()
+        announcementDucking = false
+        announcementTimerArmed = false
+        announcementChannel = null
         refreshRequest()
     }
 
     private fun refreshRequest() {
+        if (!enabled) return
         val primary = active.values.maxByOrNull { it.channel.focusPriority() }
         if (primary == null) {
             focusGeneration += 1
+            cancelRampLocked()
+            focusVolume = FULL_VOLUME
             mediaVolume = FULL_VOLUME
             abandonFocusLocked()
             return
@@ -164,11 +188,14 @@ internal class AudioFocusCoordinator(
         focusGeneration += 1
         abandonFocusLocked()
         val gain = when (primary.channel) {
-            // Never AUDIOFOCUS_GAIN: a permanent request on STREAM_MUSIC is what the head unit
-            // reported as "DiPlay owns the music stream", and the unit's own music player and
-            // WeChat were then denied the stream instead of ducking CarPlay (issue report).
-            // May-duck keeps CarPlay audible while every other player keeps its output.
-            AudioChannel.MEDIA -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+            // Issue #290: MAY_DUCK is the default because a permanent request on
+            // STREAM_MUSIC made one head unit treat DiPlay as the sole owner of
+            // the music stream (its own players denied output instead of ducking
+            // CarPlay). But another unit's vendor stack answers MAY_DUCK with a
+            // permanent duck to silence — the exclusive switch restores GAIN
+            // for those units, at the cost of possibly muting other players.
+            AudioChannel.MEDIA -> if (mediaFocusExclusive) AudioManager.AUDIOFOCUS_GAIN
+                else AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
             AudioChannel.PHONE -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
             AudioChannel.ASSISTANT -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
             // Lone navigation takes transient focus so the head unit opens its audio path
@@ -184,7 +211,7 @@ internal class AudioFocusCoordinator(
         requestedChannel = primary.channel
         val result = if (realSdkInt() >= 26 && next != null) manager?.requestAudioFocus(next as AudioFocusRequest)
         else manager?.requestAudioFocus(currentListener, AudioManager.STREAM_MUSIC, gain)
-        if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) setMediaVolume(FULL_VOLUME)
+        if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) setFocusVolume(FULL_VOLUME)
         val line = "Audio: focus requested channel=${primary.channel} gain=$gain granted=$result activeTracks=${active.size}"
         Log.i(TAG, line)
         runCatching { report(line) }
@@ -250,6 +277,137 @@ internal class AudioFocusCoordinator(
         idleHandler.postDelayed(idleRelease, recheckMillis)
     }
 
+    /**
+     * Issue #364: focus events state the volume they want in [focusVolume];
+     * the effective media volume composes that with the announcement duck,
+     * so neither side can undo the other early. A focus gain during an
+     * announcement does not restore full volume before the announcement
+     * ends, and a transient-loss mute (0f) always wins over the duck level.
+     * While the duck experiment is off the announcement flag is never set
+     * and this is exactly the old direct setMediaVolume call.
+     */
+    private fun setFocusVolume(volume: Float) {
+        focusVolume = volume
+        if (announcementDucking) {
+            cancelRampLocked()
+            setMediaVolume(minOf(volume, DUCKED_VOLUME))
+        } else if (volume < mediaVolume) {
+            cancelRampLocked()
+            setMediaVolume(volume)
+        } else if (volume > mediaVolume) {
+            if (announcementDuckEnabled) {
+                startRampLocked(volume)
+            } else {
+                setMediaVolume(volume)
+            }
+        }
+    }
+
+    /**
+     * Issues #364 & IKVN7Z (experimental, off by default): called from an announcement
+     * channel's audio writer on every accepted PCM write. CarPlay keeps the
+     * navigation track resident for a whole session, so track lifetime is
+     * the wrong signal — only frames actually flowing count as an
+     * announcement. While frames flow, media is ducked to [DUCKED_VOLUME]
+     * (composed with the focus side via [setFocusVolume]); about
+     * [ANNOUNCEMENT_RELEASE_MILLIS] after the last frame, the release check
+     * restores whatever volume the focus side currently wants through a smooth ramp.
+     */
+    fun onAnnouncementFrame(channel: AudioChannel) {
+        if (!announcementDuckEnabled || closed) return
+        if (channel == AudioChannel.MEDIA) return
+        lastAnnouncementNanos = nowNs()
+        synchronized(this) {
+            if (closed) return
+            if (!announcementDucking) {
+                announcementDucking = true
+                announcementChannel = channel
+                cancelRampLocked()
+                val line = "Audio: announcement duck engaged channel=$channel"
+                Log.i(TAG, line)
+                runCatching { report(line) }
+                setMediaVolume(minOf(focusVolume, DUCKED_VOLUME))
+            } else if (rampTargetVolume != null) {
+                cancelRampLocked()
+                setMediaVolume(minOf(focusVolume, DUCKED_VOLUME))
+            }
+            if (announcementTimerArmed) return
+            announcementTimerArmed = true
+        }
+        idleHandler.postDelayed(announcementRelease, ANNOUNCEMENT_RELEASE_MILLIS)
+    }
+
+    private val announcementRelease: Runnable = Runnable {
+        val recheckMillis: Long
+        synchronized(this) {
+            announcementTimerArmed = false
+            if (closed || !announcementDucking) return@Runnable
+            val idleNanos = nowNs() - lastAnnouncementNanos
+            if (idleNanos < ANNOUNCEMENT_RELEASE_NANOS) {
+                recheckMillis = maxOf(20L, (ANNOUNCEMENT_RELEASE_NANOS - idleNanos) / 1_000_000L + ANNOUNCEMENT_RECHECK_MILLIS)
+                announcementTimerArmed = true
+            } else {
+                announcementDucking = false
+                val line = "Audio: announcement duck released channel=$announcementChannel" +
+                    " after ${idleNanos / 1_000_000L}ms without announcement PCM"
+                announcementChannel = null
+                Log.i(TAG, line)
+                runCatching { report(line) }
+                startRampLocked(focusVolume)
+                return@Runnable
+            }
+        }
+        idleHandler.postDelayed(announcementRelease, recheckMillis)
+    }
+
+    private var rampTargetVolume: Float? = null
+
+    private val volumeRampRunnable: Runnable = Runnable {
+        synchronized(this) {
+            if (closed || announcementDucking) {
+                rampTargetVolume = null
+                return@Runnable
+            }
+            val target = rampTargetVolume ?: return@Runnable
+            val remaining = target - mediaVolume
+            if (remaining <= 0.001f) {
+                rampTargetVolume = null
+                setMediaVolume(target)
+                return@Runnable
+            }
+            val step = if (remaining > 0.16f) RAMP_STEP_COARSE else RAMP_STEP_FINE
+            val nextVolume = minOf(target, mediaVolume + step)
+            setMediaVolume(nextVolume)
+            if (nextVolume < target) {
+                idleHandler.postDelayed(volumeRampRunnable, RAMP_STEP_INTERVAL_MILLIS)
+            } else {
+                rampTargetVolume = null
+            }
+        }
+    }
+
+    private fun startRampLocked(target: Float) {
+        if (closed || announcementDucking) {
+            cancelRampLocked()
+            return
+        }
+        if (target <= mediaVolume) {
+            cancelRampLocked()
+            setMediaVolume(target)
+            return
+        }
+        rampTargetVolume = target
+        idleHandler.removeCallbacks(volumeRampRunnable)
+        idleHandler.postDelayed(volumeRampRunnable, RAMP_STEP_INTERVAL_MILLIS)
+    }
+
+    private fun cancelRampLocked() {
+        if (rampTargetVolume != null) {
+            rampTargetVolume = null
+            runCatching { idleHandler.removeCallbacks(volumeRampRunnable) }
+        }
+    }
+
     private fun setMediaVolume(volume: Float) {
         mediaVolume = volume
         active.forEach { (track, entry) -> applyMediaVolume(track, entry) }
@@ -274,11 +432,41 @@ internal class AudioFocusCoordinator(
         const val TAG = "DiPlay-AudioFocus"
         const val FULL_VOLUME = 1f
         const val DUCKED_VOLUME = 0.2f
+        /**
+         * Issues #364 & IKVN7Z: hold the duck briefly past the last announcement frame
+         * so a prompt split into bursts does not pump the media volume. Shortened from
+         * 1,500ms to 200ms with a smooth volume ramp-up on release.
+         */
+        const val ANNOUNCEMENT_RELEASE_MILLIS = 200L
+        const val ANNOUNCEMENT_RELEASE_NANOS = ANNOUNCEMENT_RELEASE_MILLIS * 1_000_000L
+        const val ANNOUNCEMENT_RECHECK_MILLIS = 50L
+        /** Volume ramp recovery step sizes and cadence (Issue IKVN7Z). */
+        const val RAMP_STEP_COARSE = 0.08f
+        const val RAMP_STEP_FINE = 0.04f
+        const val RAMP_STEP_INTERVAL_MILLIS = 25L
         /** CarPlay media may pause between songs; only a long silence gives focus back. */
         const val IDLE_RELEASE_MILLIS = 10_000L
         const val IDLE_RELEASE_NANOS = IDLE_RELEASE_MILLIS * 1_000_000L
         const val IDLE_RECHECK_MILLIS = 500L
     }
+}
+
+/**
+ * Issue #309: peak |sample| of a PCM16-LE chunk (the decoder output format
+ * this file already assumes in its fade/gain passes). Silence reads 0, full
+ * scale reads 32768. A trailing odd byte is ignored, like the fade pass.
+ */
+internal fun pcm16Peak(data: ByteArray, offset: Int, length: Int): Int {
+    var peak = 0
+    var i = offset
+    val end = offset + length - 1
+    while (i < end) {
+        val sample = (data[i].toInt() and 0xff) or (data[i + 1].toInt() shl 8)
+        val magnitude = if (sample == -32768) 32768 else if (sample < 0) -sample else sample
+        if (magnitude > peak) peak = magnitude
+        i += 2
+    }
+    return peak
 }
 
 /**
@@ -294,8 +482,14 @@ class AndroidMediaSink(
     private val videoHeight: Int = 720,
     private val preferSoftwareHevcDecoder: Boolean = false,
     private val advancedAudioChannelMapping: Boolean = false,
+    /** Issue #343-Q1: route the call downlink through the music stream (experimental). */
+    private val telephonyDownlinkViaMusic: Boolean = false,
+    /** Issue #364: duck media while announcement audio flows (experimental). */
+    private val announcementDuck: Boolean = false,
     private val audioFocusEnabled: Boolean = false,
     private val audioFocusAutoYield: Boolean = true,
+    /** Issue #290: media focus exclusive mode; read per session, default keeps MAY_DUCK. */
+    private val mediaFocusExclusive: Boolean = false,
     private val mediaChannel: Int = 0,
     private val navigationChannel: Int = 0,
     /** Issues #253/#263: per-stream PCM volume in percent (100 = unchanged). */
@@ -334,6 +528,8 @@ class AndroidMediaSink(
         audioFocusEnabled,
         audioFocusAutoYield,
         onAudioDiagnostic,
+        mediaFocusExclusive = mediaFocusExclusive,
+        announcementDuckEnabled = announcementDuck,
     )
 
     /** The media-key session may own Android's current focus request for this same sink. */
@@ -514,6 +710,16 @@ class AndroidMediaSink(
         videoDecoders[type]?.refreshPicture()
     }
 
+    /** Issue #315: legacy reverse strategy — release stream [type]'s decoder and stop its input pump. */
+    fun suspendVideoForReverse(type: Int) {
+        videoDecoders[type]?.suspendForReverse()
+    }
+
+    /** Issue #315: legacy reverse strategy — cold-start stream [type]'s decoder after the exit delay. */
+    fun resumeVideoFromReverse(type: Int) {
+        videoDecoders[type]?.resumeFromReverse()
+    }
+
     /**
      * Also decodes stream [type] onto [surface] with its own decoder, one per [key], which
      * starts at the next keyframe it asks for; null stops it. The stream's own surface is not affected.
@@ -639,7 +845,22 @@ class AndroidMediaSink(
     override fun onMicrophoneStarted(id: AudioStreamId, config: MicrophoneConfig) {
         // This callback runs on the downlink thread; microphone failures must not stop playback.
         try {
-            if (config.audioType == "telephony" && !callMicCompatibility) enterCommunicationMode(id)
+            if (config.audioType == "telephony") {
+                // Issue #290: the call volume boost does not need the communication
+                // mode, so it runs even when mic compatibility skips the mode.
+                boostCallStreamVolume()
+                // Issue #343: with the downlink on the music stream, entering the
+                // communication mode is the one remaining difference from the
+                // audible media path on firmware that takes over output routing
+                // in that mode — skip it while the experiment is on.
+                if (telephonyDownlinkViaMusic) {
+                    runCatching {
+                        onAudioDiagnostic("Audio: communication mode skipped for telephony; downlink via music stream (experimental)")
+                    }
+                } else if (!callMicCompatibility) {
+                    enterCommunicationMode(id)
+                }
+            }
             // Issue #272 follow-up: call echo complaints were undiagnosable because a
             // missing echo reference was silent — the uplink only logs when one is
             // present. State all three inputs whenever a call microphone starts.
@@ -679,12 +900,35 @@ class AndroidMediaSink(
         }
     }
 
+    /**
+     * Issue #290: raise the telephony stream to max for the call. This does not
+     * need the communication mode, so it also runs when mic compatibility (or
+     * the music-stream experiment) skips entering that mode; restoreAudioMode
+     * puts the saved volume back when the call ends.
+     */
+    private fun boostCallStreamVolume() {
+        val manager = audioManager ?: return
+        synchronized(audioModeLock) {
+            if (savedCallStreamVolume != null) return
+            val callMax = runCatching { manager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL) }.getOrNull()
+            val callNow = runCatching { manager.getStreamVolume(AudioManager.STREAM_VOICE_CALL) }.getOrNull()
+            if (callMax != null && callNow != null && callNow < callMax) {
+                savedCallStreamVolume = callNow
+                runCatching { manager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, callMax, 0) }
+                runCatching { onAudioDiagnostic("Audio: call volume boosted stream=VOICE_CALL from=$callNow to=$callMax") }
+            }
+        }
+    }
+
     private fun enterCommunicationMode(id: AudioStreamId) {
         val manager = audioManager ?: return
         synchronized(audioModeLock) {
             if (communicationModeStream != null) return
             // Select the HAL communication path before AudioRecord is created.
             savedAudioMode = manager.mode
+            // Issue #343-Q2: the remedy below may turn the speakerphone on; remember
+            // the pre-call state so teardown restores it instead of leaking it on.
+            savedSpeakerphoneOn = manager.isSpeakerphoneOn
             manager.mode = AudioManager.MODE_IN_COMMUNICATION
             communicationModeStream = id
             earpieceFallbackTried = false
@@ -695,8 +939,28 @@ class AndroidMediaSink(
                 // mode, so flag the refusal explicitly in the report (issue #272).
                 onAudioDiagnostic("Audio: mode entered communication from=$savedAudioMode" +
                     " now=${manager.mode} stream=$id" +
-                    " modeRefused=${manager.mode != AudioManager.MODE_IN_COMMUNICATION}")
+                    " modeRefused=${manager.mode != AudioManager.MODE_IN_COMMUNICATION}" +
+                    " speakerphone=${manager.isSpeakerphoneOn} scoOn=${manager.isBluetoothScoOn}")
             }
+            // Issue #343: the earpiece remedy (upstream #797) only exists on
+            // API 24+, where the routing listener can observe it — but a
+            // pre-24 head unit in communication mode with the speakerphone
+            // off and no SCO link routes VOICE_CALL to a built-in earpiece
+            // it does not have, so the call is silent while PCM flows fine
+            // (proven on the 5.1.1 reporter's logs: route=streamType=0,
+            // volume 7/7, first PCM write done, still no sound). Pre-24 has
+            // no routing callback, so derive the same condition from
+            // AudioManager state and apply the same loudspeaker remedy,
+            // once per call (moveCallToLoudspeaker guards that). It stays
+            // off when SCO is on (the call is already audible over BT) or
+            // the speakerphone is already on.
+            if (realSdkInt() < Build.VERSION_CODES.N &&
+                manager.mode == AudioManager.MODE_IN_COMMUNICATION &&
+                !manager.isSpeakerphoneOn && !manager.isBluetoothScoOn
+            ) {
+                moveCallToLoudspeaker(id)
+            }
+            boostCallStreamVolume()
         }
     }
 
@@ -706,6 +970,8 @@ class AndroidMediaSink(
      * loudspeaker on. Once per call, only in communication mode.
      */
     private var earpieceFallbackTried = false // guarded by audioModeLock
+    private var savedCallStreamVolume: Int? = null // guarded by audioModeLock
+    private var savedSpeakerphoneOn: Boolean? = null // guarded by audioModeLock
     private fun moveCallToLoudspeaker(id: AudioStreamId) {
         val manager = audioManager ?: return
         val line = synchronized(audioModeLock) {
@@ -720,8 +986,17 @@ class AndroidMediaSink(
     private fun restoreAudioMode(id: AudioStreamId?) {
         val manager = audioManager ?: return
         synchronized(audioModeLock) {
-            val active = communicationModeStream ?: return
-            if (id != null && id != active) return
+            val active = communicationModeStream
+            if (active != null && id != null && id != active) return
+            // Issue #290: the call volume is saved and boosted independently of
+            // the communication mode (mic-compatibility calls never enter it),
+            // so restore it before the mode early-return below.
+            savedCallStreamVolume?.let { saved ->
+                savedCallStreamVolume = null
+                runCatching { manager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, saved, 0) }
+                runCatching { onAudioDiagnostic("Audio: call volume restored stream=VOICE_CALL to=$saved") }
+            }
+            if (active == null) return
             communicationModeStream = null
             val line = try {
                 manager.mode = savedAudioMode
@@ -740,6 +1015,11 @@ class AndroidMediaSink(
                 Log.w("xcertplay-usb", "could not restore audio mode $savedAudioMode", error)
                 "Audio: mode restore failed requested=$savedAudioMode now=${manager.mode}" +
                     " error=${error.javaClass.simpleName}"
+            }
+            savedSpeakerphoneOn?.let { saved ->
+                savedSpeakerphoneOn = null
+                runCatching { manager.isSpeakerphoneOn = saved }
+                runCatching { onAudioDiagnostic("Audio: speakerphone restored to=$saved") }
             }
             runCatching { onAudioDiagnostic(line) }
         }
@@ -818,6 +1098,7 @@ class AndroidMediaSink(
         return AudioRenderer(
             format,
             advancedAudioChannelMapping,
+            telephonyDownlinkViaMusic,
             audioFocusEnabled,
             mediaChannel,
             navigationChannel,
@@ -892,6 +1173,25 @@ internal class ParkingOutput(width: Int, height: Int) {
     }
 }
 
+/**
+ * Pure decision behind the video decoder ordering: true when the default AVC decoder is
+ * known to hang on dynamic CarPlay streams, so the software decoder must be tried first.
+ *
+ * Issue #326: OMX.atc.video.decoder.avc on AutoChips AC83xx head units hangs/deadlocks
+ * when decoding dynamic bitstreams. AC8317 field report (2026-11-13, Android 4.2.2):
+ * OMX.mtk.video.decoder.avc on the same AC83xx hardware shows the identical hang — the
+ * tuned configure is rejected, the untuned configure renders one frame, then the decoder
+ * stalls with frames arriving but 0 rendered until a keyframe arrives. The MTK branch is
+ * scoped to AC83xx hardware (Build.HARDWARE reports an ac83 token) so other MediaTek
+ * units keep their working hardware decoder.
+ */
+internal fun isBrokenHardwareAvcDecoder(decoderName: String?, hardware: String): Boolean {
+    if (decoderName == null) return false
+    if (decoderName.startsWith("OMX.atc.video.decoder", ignoreCase = true)) return true
+    if (!decoderName.startsWith("OMX.mtk.video.decoder", ignoreCase = true)) return false
+    return hardware.lowercase(java.util.Locale.US).contains("ac83")
+}
+
 /** Serial MediaCodec video decoder: one worker owns configure and frame feeding. */
 private class VideoDecoder(
     streamType: Int,
@@ -927,6 +1227,10 @@ private class VideoDecoder(
     private val queue = VideoDecodeQueue()
     @Volatile private var running = true
     @Volatile private var decoder: MediaCodec? = null
+    // Issue #315: worker-confined; set only by the ReleaseForReverse /
+    // ResumeFromReverse jobs, read by feed/changeSurface/recover on the
+    // same worker, so no synchronization is needed.
+    private var reverseSuspended = false
     private var outputSurface: Surface? = surface
     private var parking: ParkingOutput? = null
     private var lastConfig: VideoJob.Config? = null
@@ -941,12 +1245,21 @@ private class VideoDecoder(
     private var lastKeyFrameRequestNs = 0L
     private var consecutiveInputWithoutOutput = 0
     private var consecutiveDroppedWithoutKeyFrame = 0
+    /** Issue #351: stale frames dropped while the pipeline is still rendering. */
+    private var staleFramesDropped = 0
+    /** Issue #346: consecutive output stalls; forces a decoder rebuild at threshold. */
+    private val stallRebuildTracker = DecoderStallRebuildTracker()
     /** Issue #216: when the current wait for an acceptable keyframe began. */
     private var keyframeWaitStartedNs = 0L
     private var lastOutputRenderedNs = 0L
     private var surfaceAttachedAtNs = 0L
     // The main screen keeps the historical log format; other screens are labelled.
-    private val stats = VideoStats(statsLabel ?: if (streamType == MAIN_SCREEN_TYPE) "" else " stream=$streamType")
+    private val stats = VideoStats(
+        statsLabel ?: if (streamType == MAIN_SCREEN_TYPE) "" else " stream=$streamType",
+        onWindow = { window ->
+            if (streamType == MAIN_SCREEN_TYPE) runCatching { MeasuredDecodeStats.record(window) }
+        },
+    )
     private val thread = Thread(::run, "carplay-video").apply { isDaemon = true }
 
     fun start() { thread.start() }
@@ -966,6 +1279,16 @@ private class VideoDecoder(
             queue.discardFrames()
         }
         queue.offer(VideoJob.SurfaceChanged(surface))
+    }
+
+    /** Issue #315: legacy reverse strategy — fully release the codec and stop the input pump. */
+    fun suspendForReverse() {
+        queue.offer(VideoJob.ReleaseForReverse)
+    }
+
+    /** Issue #315: legacy reverse strategy — cold-start the codec after the exit delay. */
+    fun resumeFromReverse() {
+        queue.offer(VideoJob.ResumeFromReverse)
     }
 
     /** Asks the worker to stop rendering to [surface], parking the codec when [park]. */
@@ -1022,12 +1345,57 @@ private class VideoDecoder(
                         is VideoJob.Config -> configureDecoder(job)
                         is VideoJob.Frame -> {
                             if (System.nanoTime() - job.receivedNs > MAX_FRAME_AGE_NS) {
-                                queue.discardFrames()
-                                recover("video backlog exceeded 800 ms", allowRebuild = false)
+                                // Issue #351: when frames are still rendering, the
+                                // decoder is behind but alive — drop just this stale
+                                // frame instead of flushing the whole queue and
+                                // rebuilding (that loop is what made slow-decode
+                                // streams stutter). A genuine stall (nothing
+                                // rendered recently) keeps the old path below.
+                                if (System.nanoTime() - lastOutputRenderedNs < MIN_OUTPUT_STALL_NS) {
+                                    staleFramesDropped++
+                                    // IKT54J: the dropped frame may be a reference
+                                    // for the frames behind it; feeding those
+                                    // anyway decodes them against a missing
+                                    // reference and the picture turns into mosaic
+                                    // blocks until the next IDR. Hold the chain
+                                    // instead: feed() now rejects non-IDR frames
+                                    // and requests a keyframe, so the cost is a
+                                    // brief freeze on the last good frame rather
+                                    // than corrupted output. No flush or rebuild
+                                    // happens, so the #351 stutter loop does not
+                                    // come back.
+                                    referenceChain.onReferenceLost()
+                                    if (staleFramesDropped == 1 || staleFramesDropped % 30 == 0) {
+                                        report("video stale frame dropped count=$staleFramesDropped (decoder behind; reference held until keyframe)")
+                                    }
+                                } else {
+                                    queue.discardFrames()
+                                    recover("video backlog exceeded 800 ms", allowRebuild = false)
+                                }
                             } else feed(job.nalus, localTimeOf(job))
                         }
                         is VideoJob.SurfaceChanged -> changeSurface(job.surface)
                         is VideoJob.DetachSurface -> detach(job.request)
+                        is VideoJob.ReleaseForReverse -> {
+                            queue.discardFrames()
+                            releaseDecoder()
+                            consecutiveInputWithoutOutput = 0
+                            consecutiveDroppedWithoutKeyFrame = 0
+                            keyframeWaitStartedNs = 0L
+                            referenceChain.reset()
+                            reverseSuspended = true
+                            report("video: decoder released for reverse (legacy cold start)")
+                        }
+                        is VideoJob.ResumeFromReverse -> {
+                            reverseSuspended = false
+                            if (outputSurface != null) {
+                                releaseDecoder()
+                                lastConfig?.let {
+                                    configureDecoder(it)
+                                    requestKeyFrameIfDue(force = true)
+                                }
+                            }
+                        }
                         // Once per new surface, so it skips the rate limit an earlier request may still hold.
                         is VideoJob.RefreshPicture -> {
                             lastKeyFrameRequestNs = System.nanoTime()
@@ -1043,10 +1411,15 @@ private class VideoDecoder(
                     }
                     decoder?.let(::drainOutput)
                     stats.logIfDue()?.let(report)
-                    if (outputSurface != null && stats.shouldRecoverDegeneratePipeline()) {
-                        recover("pipeline receiving frames but 0 rendered", allowRebuild = false)
-                    } else if (referenceChain.needsKeyFrame && lastConfig != null && outputSurface != null) {
-                        requestKeyFrameIfDue()
+                    // Issue #315: while suspended for reverse, received frames
+                    // are intentionally dropped and 0 are rendered; neither the
+                    // degenerate recovery nor the keyframe loop may fire.
+                    if (!reverseSuspended) {
+                        if (outputSurface != null && stats.shouldRecoverDegeneratePipeline()) {
+                            recover("pipeline receiving frames but 0 rendered", allowRebuild = false)
+                        } else if (referenceChain.needsKeyFrame && lastConfig != null && outputSurface != null) {
+                            requestKeyFrameIfDue()
+                        }
                     }
                 } catch (error: Exception) {
                     if (running) Log.e(TAG, "video decoder job failed: ${job?.javaClass?.simpleName}", error)
@@ -1103,20 +1476,53 @@ private class VideoDecoder(
                 pps.takeIf { it.isNotEmpty() }?.let { START_CODE + it },
             )
         }
-        // Issue: API 17 H.264 first frame fails. Old decoders ignore csd-0/csd-1,
-        // so prepend SPS/PPS in-band to the first frame (Annex B format).
-        inBandSpsPps = if (codec != VideoCodec.H265 && realSdkInt() == 17) {
+        // Some vendor decoders (e.g. MediaTek c2.mtk.avc.decoder) reject the tuned
+        // parameters with BAD_VALUE. Fall back to a minimal format, then to software.
+        // Issue #326: AutoChips AC83xx chipsets (OMX.atc.video.decoder.avc) deadlock/hang on dynamic CarPlay AVC streams;
+        // on those, prioritize the software decoder fallback directly. AC8317 field report
+        // (2026-11-13): OMX.mtk.video.decoder.avc on the same AC83xx hardware hangs
+        // identically and is covered by the same rule, scoped to ac83 hardware.
+        // Issue #324 follow-up: HiSilicon/K3v2 (OMX.k3.video.decoder.avc) is different.
+        // Its hardware decoder aborts in ACodec (CHECK(def.nBufferSize >= size)) only
+        // when KEY_MAX_INPUT_SIZE forces a port buffer larger than the OMX port's
+        // native capacity — and on KitKat it is the ONLY decoder that can decode
+        // CarPlay's Main/High CABAC stream (the software decoder is Baseline-only
+        // PacketVideo and fails every frame with -2). So for K3 the hardware
+        // decoder is used first, with unconstrained native port sizing
+        // (tuned = false sets neither KEY_MAX_INPUT_SIZE nor KEY_PRIORITY);
+        // software stays only as a last resort if hardware configure throws.
+        val defaultBroken = isKnownBrokenHardwareDecoder(mime)
+        val nativeSizing = isNativeSizingHardwareDecoder(mime)
+        val software = softwareDecoderName(mime)
+        // Issue #324: API <= 19 H.264 decoders (such as SoftAVC / OMX.google.h264.decoder on KitKat/JellyBean)
+        // or old vendor decoders fail or ignore csd-0/csd-1 without in-band Annex B headers.
+        // Prepend SPS/PPS in-band to the first frame (Annex B format).
+        inBandSpsPps = if (codec != VideoCodec.H265 && (realSdkInt() <= 19 || defaultBroken)) {
             val (sps, pps) = MediaCodecSupport.avcParameterSets(codecData)
             if (sps.isNotEmpty() && pps.isNotEmpty()) {
                 START_CODE + sps + START_CODE + pps
             } else null
         } else null
-        // Some vendor decoders (e.g. MediaTek c2.mtk.avc.decoder) reject the tuned
-        // parameters with BAD_VALUE. Fall back to a minimal format, then to software.
-        val attempts = listOf(
-            DecoderAttempt(codecName = null, tuned = true),
-            DecoderAttempt(codecName = null, tuned = false),
-        ) + softwareDecoderName(mime)?.let { listOf(DecoderAttempt(it, tuned = false)) }.orEmpty()
+        val attempts = when {
+            nativeSizing -> {
+                Log.w(TAG, "default hardware decoder for $mime needs native port sizing on this device; trying hardware without forced input size first")
+                listOf(DecoderAttempt(codecName = null, tuned = false)) +
+                    software?.let { listOf(DecoderAttempt(it, tuned = false)) }.orEmpty()
+            }
+            defaultBroken && software != null -> {
+                Log.w(TAG, "default hardware decoder for $mime is known broken on this device; prioritizing software decoder: $software")
+                listOf(DecoderAttempt(software, tuned = false)) + listOf(
+                    DecoderAttempt(codecName = null, tuned = true),
+                    DecoderAttempt(codecName = null, tuned = false),
+                )
+            }
+            else -> {
+                listOf(
+                    DecoderAttempt(codecName = null, tuned = true),
+                    DecoderAttempt(codecName = null, tuned = false),
+                ) + software?.let { listOf(DecoderAttempt(it, tuned = false)) }.orEmpty()
+            }
+        }
         var next: MediaCodec? = null
         for (attempt in attempts) {
             next = tryConfigure(mime, csd, surface, attempt)
@@ -1188,6 +1594,44 @@ private class VideoDecoder(
         }
     }
 
+    private fun isKnownBrokenHardwareDecoder(mime: String): Boolean {
+        if (mime != MediaFormat.MIMETYPE_VIDEO_AVC) return false
+        val defaultDecoder = defaultDecoderName(mime) ?: return false
+        return isBrokenHardwareAvcDecoder(defaultDecoder, Build.HARDWARE)
+    }
+
+    /**
+     * Issue #324 follow-up: OMX.k3.video.decoder.avc on HiSilicon/K3v2
+     * (Huawei Ascend P6/P7 etc.) aborts with CHECK(def.nBufferSize >= size)
+     * in ACodec.cpp when KEY_MAX_INPUT_SIZE forces a port buffer larger
+     * than the OMX port's native capacity — but it is the only decoder on
+     * KitKat that handles CarPlay's Main/High CABAC stream, so it must be
+     * used with native (unconstrained) port sizing, not skipped.
+     */
+    private fun isNativeSizingHardwareDecoder(mime: String): Boolean {
+        if (mime != MediaFormat.MIMETYPE_VIDEO_AVC) return false
+        val defaultDecoder = defaultDecoderName(mime) ?: return false
+        return defaultDecoder.startsWith("OMX.k3.video.decoder", ignoreCase = true)
+    }
+
+    private fun defaultDecoderName(mime: String): String? {
+        if (realSdkInt() >= Build.VERSION_CODES.Q) {
+            return MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull {
+                !it.isEncoder && mime in it.supportedTypes
+            }?.name
+        }
+        if (realSdkInt() >= 16) {
+            @Suppress("DEPRECATION")
+            return (0 until MediaCodecList.getCodecCount()).mapNotNull { i ->
+                @Suppress("DEPRECATION")
+                MediaCodecList.getCodecInfoAt(i)
+            }.firstOrNull {
+                !it.isEncoder && mime in it.supportedTypes
+            }?.name
+        }
+        return null
+    }
+
     private fun softwareDecoderName(mime: String): String? {
         if (realSdkInt() >= Build.VERSION_CODES.Q) {
             return MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull {
@@ -1242,17 +1686,23 @@ private class VideoDecoder(
             when (outcome) {
                 DetachOutcome.NOT_RENDERING -> Unit
                 DetachOutcome.PARKED -> {
-                    val consumer = parking ?: ParkingOutput(width, height).also { parking = it }
-                    try {
-                        if (realSdkInt() < 23) throw IllegalStateException("Surface parking requires Android 6")
-                        checkNotNull(decoder).setOutputSurface(consumer.surface)
-                        outputSurface = consumer.surface
-                        Log.i(TAG, "video decoder parked off screen")
-                    } catch (error: Exception) {
-                        Log.w(TAG, "video decoder could not park; releasing it", error)
+                    if (realSdkInt() < 23) {
                         outcome = DetachOutcome.RELEASED
                         outputSurface = null
                         releaseDecoder()
+                        Log.i(TAG, "video decoder detached (surface parking unsupported on API < 23)")
+                    } else {
+                        try {
+                            val consumer = parking ?: ParkingOutput(width, height).also { parking = it }
+                            checkNotNull(decoder).setOutputSurface(consumer.surface)
+                            outputSurface = consumer.surface
+                            Log.i(TAG, "video decoder parked off screen")
+                        } catch (error: Exception) {
+                            Log.w(TAG, "video decoder could not park; releasing it", error)
+                            outcome = DetachOutcome.RELEASED
+                            outputSurface = null
+                            releaseDecoder()
+                        }
                     }
                 }
                 DetachOutcome.RELEASED -> {
@@ -1278,10 +1728,18 @@ private class VideoDecoder(
         queue.discardFrames()
         consecutiveInputWithoutOutput = 0
         consecutiveDroppedWithoutKeyFrame = 0
+        stallRebuildTracker.reset()
         keyframeWaitStartedNs = 0L
         val now = System.nanoTime()
         lastOutputRenderedNs = now
         surfaceAttachedAtNs = now
+        if (reverseSuspended) {
+            // Issue #315: a surface churn during reverse must only record
+            // the new surface; the codec stays released until the delayed
+            // cold start (ResumeFromReverse) runs.
+            releaseDecoder()
+            return
+        }
         if (surface == null) {
             releaseDecoder()
             Log.i(TAG, "video decoder detached from surface")
@@ -1307,6 +1765,9 @@ private class VideoDecoder(
     }
 
     private fun feed(nalus: ByteArray, presentNs: Long = 0L) {
+        // Issue #315: the input pump is cut while suspended for reverse —
+        // frames must be dropped here, not lazily rebuild the codec below.
+        if (reverseSuspended) return
         val annexB = MediaCodecSupport.toAnnexB(nalus)
         val config = lastConfig ?: return
         if (outputSurface == null) return
@@ -1357,7 +1818,7 @@ private class VideoDecoder(
             running = { running }, drain = { drainOutput(codec) },
             dequeue = { codec.dequeueInputBuffer(INPUT_TIMEOUT_US) },
         )
-        if (index < 0) { recover("video decoder input stalled"); return }
+        if (index < 0) { recover("video decoder input stalled", allowRebuild = false); return }
         @Suppress("DEPRECATION")
         val input = if (realSdkInt() >= Build.VERSION_CODES.LOLLIPOP) codec.getInputBuffer(index) else codec.inputBuffers[index]
         checkNotNull(input) { "Decoder input buffer unavailable" }
@@ -1397,13 +1858,24 @@ private class VideoDecoder(
             val elapsedSinceSurfaceAttachNs = now - surfaceAttachedAtNs
             // Allow 3.5s warm-up grace period after surface attach to prevent false positives on busy map streams (Issue #315, #320)
             if (elapsedSinceSurfaceAttachNs >= 3_500_000_000L && (lastOutputRenderedNs == 0L || elapsedSinceOutputNs >= MIN_OUTPUT_STALL_NS)) {
-                recover("video decoder output stalled: $consecutiveInputWithoutOutput frames queued without output", allowRebuild = false)
+                // Issue #346: the first stalls only re-ask for a keyframe (existing
+                // behavior); once the tracker counts repeated stalls, force a decoder
+                // rebuild even though a keyframe wait is already in progress — on the
+                // T3 unit the requested keyframes never unstick the wedged decoder,
+                // so the wait never clears and the plain path never rebuilds.
+                val forceRebuild = !reverseSuspended && stallRebuildTracker.onStall()
+                val reason = "video decoder output stalled: $consecutiveInputWithoutOutput frames queued without output" +
+                    if (forceRebuild) " (repeated stalls; forcing decoder rebuild)" else ""
+                recover(reason, allowRebuild = false, forceRebuild = forceRebuild)
                 return
             }
         }
     }
 
-    private fun recover(reason: String, allowRebuild: Boolean = true) {
+    private fun recover(reason: String, allowRebuild: Boolean = true, forceRebuild: Boolean = false) {
+        // Issue #315: no recovery may resurrect the codec while it is
+        // suspended for reverse; the delayed cold start owns the restart.
+        if (reverseSuspended) return
         Log.w(TAG, "Video recovery: $reason; waiting for keyframe")
         // Issue #251: while a keyframe wait is already running, rebuilding the
         // decoder races the keyframe's arrival — the rebuild discards the
@@ -1415,7 +1887,12 @@ private class VideoDecoder(
         // genuinely wedged codec still gets rebuilt once per keyframe cycle:
         // accepting an IDR clears the wait, so the next recovery rebuilds.
         // Queue backlog / frame drops keep the healthy decoder instance and only wait for IDR.
-        val rebuild = allowRebuild && !referenceChain.needsKeyFrame
+        // Issue #346: a forced rebuild bypasses the keyframe-wait gate: when the
+        // decoder is genuinely wedged, the requested keyframes never arrive (or
+        // never unstick it), so the wait never clears and the plain path would
+        // never rebuild. The stall tracker rate-limits this to one forced rebuild
+        // per REBUILD_AFTER_STALLS stalls.
+        val rebuild = forceRebuild || (allowRebuild && !referenceChain.needsKeyFrame)
         consecutiveInputWithoutOutput = 0
         consecutiveDroppedWithoutKeyFrame = 0
         keyframeWaitStartedNs = 0L
@@ -1473,6 +1950,8 @@ private class VideoDecoder(
                     if (shown) {
                         stats.onRendered()
                         consecutiveInputWithoutOutput = 0
+                        staleFramesDropped = 0
+                        stallRebuildTracker.onOutput()
                         lastOutputRenderedNs = now
                     }
                     if (shown && !renderedFrameLogged) {
@@ -1531,6 +2010,9 @@ private class VideoDecoder(
             } catch (_: Exception) {
                 // Best effort.
             }
+            // This surface is reused by decoder recovery and later sessions. Never call
+            // lockCanvas here: its CPU producer stays connected until Surface destruction,
+            // preventing MediaCodec from reconnecting. The host owns disconnect UI.
         }
     }
 
@@ -1571,6 +2053,7 @@ private fun MediaFormat.intOrNull(key: String): Int? =
 private class AudioRenderer(
     val format: AudioFormat,
     private val advancedAudioChannelMapping: Boolean,
+    private val telephonyDownlinkViaMusic: Boolean,
     private val audioFocusEnabled: Boolean,
     private val mediaChannel: Int,
     private val navigationChannel: Int,
@@ -1629,6 +2112,7 @@ private class AudioRenderer(
     private val frameBytes = if (format.channels >= 2) 4 else 2
     private var totalWrittenFrames = 0L
     private var writtenFramesThisWindow = 0L
+    private var pcmPeakThisWindow = 0
     private var writeErrorsThisWindow = 0
     private var lastWriteErrorCode: Int? = null
     private var zeroWritesThisWindow = 0
@@ -1636,6 +2120,8 @@ private class AudioRenderer(
     private var lastPlaybackHeadFrames: Long? = null
     private var maxWriteMs = 0L
     private var statsWindowStartNs = 0L
+    /** IKTCRS: consecutive stats windows with zero received packets. */
+    private var zeroRxWindows = 0
     private var statsLastUnderruns = 0
     private var bytesPerSecond = 0
     private val bufferProgress = AudioBufferProgress(if (format.channels >= 2) 4 else 2)
@@ -1666,13 +2152,41 @@ private class AudioRenderer(
                 while (gap > old && !maxArrivalGapMs.compareAndSet(old, gap)) old = maxArrivalGapMs.get()
             }
         }
-        if (!started || !queue.offer(AudioPacket(rtp, sample))) {
-            if (started) packetsDropped.incrementAndGet()
-            if (started && !droppedPacketsLogged) {
-                droppedPacketsLogged = true
-                Log.w(TAG, "audio queue full; dropping newest packets to bound latency")
-                report("Audio: queue full audioType=${format.audioType}")
+        if (!started) return
+        // IKT54J: the backlog used to be bounded only by the 192-packet hard
+        // cap, and overflow dropped the NEWEST packet — under sustained
+        // decoder starvation the queue hovered at ~1.75 s of stale audio
+        // (median 82 packets on an NTDA3) while fresh packets were thrown
+        // away, and A/V sync drifted with it. Encoded packets decode
+        // independently, so trim from the OLDEST end instead: measure the
+        // backlog in stream time via RTP timestamps and drop the head while
+        // it spans more than MAX_SYNC_BACKLOG_MS. Short bursts after a Wi-Fi
+        // gap stay under the budget and are still kept whole.
+        var trimmedBacklog = false
+        if (format.sampleRate > 0) {
+            var guard = 0
+            while (guard++ < MAX_QUEUED_PACKETS) {
+                val head = queue.peek() ?: break
+                val backlogMs = (sample - head.sample).toLong() * 1_000L / format.sampleRate
+                if (backlogMs <= MAX_SYNC_BACKLOG_MS) break
+                if (queue.poll() == null) break
+                packetsDropped.incrementAndGet()
+                trimmedBacklog = true
             }
+        }
+        if (!queue.offer(AudioPacket(rtp, sample))) {
+            // Hard cap raced: make room from the oldest end, never the newest.
+            // Exactly one packet is lost either way (the polled oldest, or the
+            // incoming one if a racing submitter refilled the slot).
+            queue.poll()
+            queue.offer(AudioPacket(rtp, sample))
+            packetsDropped.incrementAndGet()
+            trimmedBacklog = true
+        }
+        if (trimmedBacklog && !droppedPacketsLogged) {
+            droppedPacketsLogged = true
+            Log.w(TAG, "audio backlog over ${MAX_SYNC_BACKLOG_MS}ms; dropping oldest packets to bound latency")
+            report("Audio: backlog trimmed audioType=${format.audioType}")
         }
     }
 
@@ -2048,8 +2562,9 @@ private class AudioRenderer(
             TAG,
             "audio route type=${format.payloadType} audioType=${format.audioType} " +
                 "mode=${if (advancedAudioChannelMapping) AudioChannelMappingMode.AUTOMOTIVE_BUS else AudioChannelMappingMode.MOBILE_COMPATIBLE} " +
-                "channel=${selection.channel} usage=${usageFor(selection.channel)} " +
-                "contentType=${contentTypeFor(selection.contentType)} " +
+                "channel=${selection.channel} usage=${effectiveUsage(selection)} " +
+                "contentType=${effectiveContentType(selection)} " +
+                "telephonyViaMusic=$telephonyDownlinkViaMusic " +
                 "streamOverride=$streamOverride " +
                 "focus=${if (audioFocusEnabled) "on" else "off"}",
         )
@@ -2061,6 +2576,19 @@ private class AudioRenderer(
         AudioChannel.NAVIGATION -> navigationChannel
         else -> 0
     }
+
+    /**
+     * Issue #343-Q1: with the music-stream experiment on, the call downlink leaves
+     * the telephony path on the usage layer too (the legacy stream type is switched
+     * in AudioChannelMapper); channel stays PHONE, call mode and mic unchanged.
+     */
+    private fun effectiveUsage(selection: AudioChannelSelection): Int =
+        if (telephonyDownlinkViaMusic && selection.channel == AudioChannel.PHONE) AudioAttributes.USAGE_MEDIA
+        else usageFor(selection.channel)
+
+    private fun effectiveContentType(selection: AudioChannelSelection): Int =
+        if (telephonyDownlinkViaMusic && selection.channel == AudioChannel.PHONE) AudioAttributes.CONTENT_TYPE_MUSIC
+        else contentTypeFor(selection.contentType)
 
     @RequiresApi(21)
     private fun audioAttributesFor(
@@ -2078,8 +2606,8 @@ private class AudioRenderer(
             }
         }
         return AudioAttributes.Builder()
-            .setUsage(usageFor(selection.channel))
-            .setContentType(contentTypeFor(selection.contentType))
+            .setUsage(effectiveUsage(selection))
+            .setContentType(effectiveContentType(selection))
             .build()
     }
 
@@ -2094,6 +2622,7 @@ private class AudioRenderer(
             payloadType = format.payloadType,
             mode = mode,
             navigationStreamType = navigationStreamType,
+            telephonyDownlinkViaMusic = telephonyDownlinkViaMusic,
         )
     }
 
@@ -2108,8 +2637,8 @@ private class AudioRenderer(
             }
         }
         return AudioAttributes.Builder()
-            .setUsage(usageFor(selection.channel))
-            .setContentType(contentTypeFor(selection.contentType))
+            .setUsage(effectiveUsage(selection))
+            .setContentType(effectiveContentType(selection))
             .build()
     }
 
@@ -2151,6 +2680,7 @@ private class AudioRenderer(
             payloadType = format.payloadType,
             mode = mode,
             navigationStreamType = navigationStreamType,
+            telephonyDownlinkViaMusic = telephonyDownlinkViaMusic,
         ).streamType
     }
 
@@ -2427,9 +2957,17 @@ private class AudioRenderer(
                 break
             }
             if (count < writeLength) partialWritesThisWindow++
+            // Issue #309: frame counts prove PCM flows but not that it is audible —
+            // a phone-side duck stuck at silence looks identical in the stats. Track
+            // the window peak so the next report can tell silence from sound.
+            pcmPeakThisWindow = maxOf(pcmPeakThisWindow, pcm16Peak(data, offset + written, count))
             written += count
             // Keeps the focus lease alive only while audio is actually flowing.
             audioFocusCoordinator.onPcmRendered()
+            // Issue #364: announcement frame activity drives the active-duck
+            // experiment; the coordinator ignores media frames and stays
+            // inert while the setting is off.
+            mappedChannel?.let(audioFocusCoordinator::onAnnouncementFrame)
             val framesWritten = count / frameBytes
             totalWrittenFrames += framesWritten
             writtenFramesThisWindow += framesWritten
@@ -2502,16 +3040,17 @@ private class AudioRenderer(
             previous?.let { (current - it) and 0xffff_ffffL }
         }
         val queuedFrames = playbackHeadFrames?.let { (totalWrittenFrames - it).coerceAtLeast(0L) }
+        val windowRx = packetsReceived.getAndSet(0)
         val line = "audio stats audioType=${format.audioType} channel=$mappedChannel " +
             "routeType=${if (realSdkInt() >= 23) currentTrack?.routedDevice?.type ?: -1 else -1} codec=${format.codec} " +
             "trackState=${currentTrack?.state ?: -1} playState=${currentTrack?.playState ?: -1} " +
             "sampleRate=${currentTrack?.sampleRate ?: format.sampleRate} " +
             "trackBufferFrames=${if (realSdkInt() >= 23) currentTrack?.bufferSizeInFrames ?: -1 else -1} " +
-            "rx=${packetsReceived.getAndSet(0)} " +
+            "rx=$windowRx " +
             "dropped=${packetsDropped.getAndSet(0)} underruns=+${underruns - statsLastUnderruns} queue=${queue.size} " +
             "playing=$playbackStarted maxGapMs=${maxArrivalGapMs.getAndSet(0)} " +
             "sinceRxMs=${if (lastRx == 0L) -1 else (now - lastRx) / 1_000_000L} maxWriteMs=$maxWriteMs " +
-            "writtenFrames=$writtenFramesThisWindow totalWrittenFrames=$totalWrittenFrames " +
+            "writtenFrames=$writtenFramesThisWindow pcmPeak=$pcmPeakThisWindow totalWrittenFrames=$totalWrittenFrames " +
             "playbackHeadFrames=${playbackHeadFrames ?: -1} playbackAdvanceFrames=${playbackAdvanceFrames ?: -1} " +
             "estimatedQueuedFrames=${queuedFrames ?: -1} writeErrors=$writeErrorsThisWindow " +
             "lastWriteError=${lastWriteErrorCode ?: "none"} zeroWrites=$zeroWritesThisWindow " +
@@ -2519,6 +3058,27 @@ private class AudioRenderer(
             "decoderDroppedTotal=$inputDropped outputBuffersTotal=$outputBuffers rebuffers=$rebufferCount ended=$force"
         Log.i(STATS_TAG, line)
         report(line)
+        // IKTCRS: surface sustained receive starvation as its own one-shot
+        // event. The per-window stats lines show rx=0, but a flat run of them
+        // is easy to miss in a 28k-line report; one explicit line marks when
+        // the phone stopped sending while this renderer stayed alive, which
+        // separates "iPhone stopped pushing" from "we dropped it". Purely a
+        // diagnostic: user-paused silence looks identical, so nothing acts on
+        // it. Fires once per starvation episode; re-arms when packets resume.
+        if (!force) {
+            if (windowRx == 0) {
+                zeroRxWindows++
+                if (zeroRxWindows == STARVED_WINDOWS) {
+                    report(
+                        "audio starved audioType=${format.audioType} " +
+                            "(no packets for ${STARVED_WINDOWS * (STATS_WINDOW_NS / 1_000_000)}ms " +
+                            "while the renderer is alive; informational only)",
+                    )
+                }
+            } else {
+                zeroRxWindows = 0
+            }
+        }
         if (format.codec != AudioCodecKind.LPCM) {
             // Keep this separate: the exported diagnostic recorder caps each line at 700 characters.
             val decoderLine = "Audio: decoder stats audioType=${format.audioType} codec=${format.codec} " +
@@ -2531,6 +3091,7 @@ private class AudioRenderer(
         statsLastUnderruns = underruns
         maxWriteMs = 0L
         writtenFramesThisWindow = 0L
+        pcmPeakThisWindow = 0
         writeErrorsThisWindow = 0
         lastWriteErrorCode = null
         zeroWritesThisWindow = 0
@@ -2625,7 +3186,7 @@ private class AudioRenderer(
         // AudioManager.STREAM_ACCESSIBILITY was added in API 26 (value 10). Keep compatibility for API < 26.
         const val STREAM_ACCESSIBILITY_COMPAT = 10
         const val AAC_OBJECT_TYPE_LC = 2
-        const val MIN_OPUS_PACKET_BYTES = 4
+        const val MIN_OPUS_PACKET_BYTES = 1
         const val OPUS_CODEC_DELAY_NANOS = 6_500_000L
         const val OPUS_SEEK_PRE_ROLL_NANOS = 80_000_000L
         const val INPUT_TIMEOUT_US = 10_000L
@@ -2636,9 +3197,17 @@ private class AudioRenderer(
         const val BUFFER_TAIL_WAIT_NS = 500_000_000L
         // Holds a burst after a Wi-Fi gap (~4 s of AAC) instead of dropping it.
         const val MAX_QUEUED_PACKETS = 192
+        // IKT54J: latency budget for the pre-decode backlog, in stream time.
+        // Bursts shorter than this are kept whole (the Wi-Fi-gap case above);
+        // a backlog older than this is stale audio that only drifts A/V sync,
+        // so submit() drops it from the oldest end.
+        const val MAX_SYNC_BACKLOG_MS = 600L
         const val PREBUFFER_WRITE_CHUNK_BYTES = 2 * 1024
         const val STATS_TAG = "DiPlay-AudioStats"
         const val STATS_WINDOW_NS = 5_000_000_000L
+        /** IKTCRS: zero-rx stats windows (3 x 5 s = 15 s) before the one-shot
+         * "audio starved" diagnostic line fires. */
+        const val STARVED_WINDOWS = 3
         const val DECODED_BUFFER_LOG_INTERVAL = 50
         // Issue #170: inputs before the degenerate-decoder check may fire (~5 s of AAC-LC).
         const val DEGENERATE_DECODER_MIN_INPUTS = 120

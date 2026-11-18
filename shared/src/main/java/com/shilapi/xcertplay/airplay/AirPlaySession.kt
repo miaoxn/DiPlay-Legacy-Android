@@ -26,6 +26,9 @@ data class AirPlayDeviceInfo(
 /** Session lifecycle and command callbacks for the driver/UI layer. */
 interface AirPlaySessionListener {
     fun onTcpAccepted(event: AirPlayTcpAccepted) {}
+    /** Called around each RTSP request handler; implementations must not block. */
+    fun onControlRequestStarted(method: String, path: String, cseq: String) {}
+    fun onControlRequestCompleted(method: String, path: String, cseq: String, elapsedMillis: Long) {}
     fun onSessionActive(session: AirPlaySession) {}
     fun onSessionEnded(session: AirPlaySession) {}
     fun onVideoFrameRendered(session: AirPlaySession) {}
@@ -40,6 +43,13 @@ interface AirPlaySessionListener {
     fun onModesChanged(session: AirPlaySession, appStates: List<Map<String, Any?>>, resources: List<Map<String, Any?>>) {}
     fun onPortBound(port: Int, isTcp: Boolean) {}
     fun onDebugLog(message: String) {}
+    /**
+     * One connection-chain milestone arrived (wired 16 steps / wireless 12).
+     * Emitted at the same point that writes the chain log line, so the step
+     * numbers on screen and in the log can never drift apart. The default is
+     * a no-op; implementations must not block.
+     */
+    fun onChainStage(event: ChainStageEvent) {}
 }
 
 /** Stream transport seam; media decode/render is supplied by a later layer. */
@@ -496,6 +506,8 @@ class AirPlaySession(
                 for (request in parsed.messages) {
                     val cseq = request.headers["cseq"] ?: "-"
                     val path = request.path.lowercase()
+                    val handlerStartedNanos = System.nanoTime()
+                    listener.onControlRequestStarted(request.method, request.path, cseq)
                     val showInDebugOverlay =
                         !path.endsWith("/feedback") &&
                             !(request.method == "POST" && path.endsWith("/command"))
@@ -528,6 +540,9 @@ class AirPlaySession(
                                 "${error.javaClass.simpleName}: ${error.message?.take(200)}",
                         )
                         RtspMessage.Response(status = 500)
+                    } finally {
+                        val elapsed = ((System.nanoTime() - handlerStartedNanos) / 1_000_000L).coerceAtLeast(0)
+                        listener.onControlRequestCompleted(request.method, request.path, cseq, elapsed)
                     }
                     debugLog(
                         "airplay tx status=${response.status ?: 200} cseq=$cseq body=${response.body.size}",
@@ -789,6 +804,13 @@ class AirPlaySession(
         val type = string(body["type"])
         val params = asMap(body["params"]) ?: emptyMap()
         debugLog("airplay command type=$type keys=${params.keys.sorted()}")
+        if (type == "duckAudio" || type == "unduckAudio") {
+            // Issue #309: duck/duck pairs balanced 67/67 in a report, but the
+            // volume values were never logged, so a duck that never restores
+            // its volume is invisible in the report (playback still shows
+            // playing=true). Log the values so the next report can prove it.
+            debugLog("airplay command type=$type volume=${params["volume"]} durationMs=${params["durationMs"]}")
+        }
         val streamId = request.headers["x-apple-streamid"]?.toLongOrNull()
         val data = params["data"] as? ByteArray
         if (streamId != null && data != null) {

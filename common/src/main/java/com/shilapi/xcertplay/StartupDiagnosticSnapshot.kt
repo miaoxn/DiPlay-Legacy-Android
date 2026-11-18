@@ -12,7 +12,25 @@ internal object StartupDiagnosticSnapshot {
                 .putLong("receivedAt", System.currentTimeMillis())
                 .putBoolean("launchEnabled", launchEnabled)
                 .putString("launchResult", if (launchEnabled) "pending" else "disabled")
-                .remove("failureClass").apply()
+                .remove("failureClass").remove("bootWatchdog").apply()
+        }
+    }
+
+    /** Latest Bluetooth-music auto-open outcome line; sanitized like failureClass. */
+    fun bluetoothMusic(context: Context, outcome: String) {
+        runCatching {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putString("bluetoothMusic", outcome.take(120)
+                    .replace(Regex("[^A-Za-z0-9_.:() -]"), "?")).apply()
+        }
+    }
+
+    /** Latest boot fronting watchdog outcome; sanitized like failureClass. */
+    fun bootWatchdog(context: Context, outcome: String) {
+        runCatching {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putString("bootWatchdog", outcome.take(120)
+                    .replace(Regex("[^A-Za-z0-9_.:() -]"), "?")).apply()
         }
     }
 
@@ -34,7 +52,9 @@ internal object StartupDiagnosticSnapshot {
             "Boot diagnostics received=true receivedAtEpochMs=$receivedAt " +
                 "launchEnabledAtBoot=${prefs.getBoolean("launchEnabled", false)} " +
                 "launchResult=${prefs.getString("launchResult", "unknown")} " +
-                "failureClass=${prefs.getString("failureClass", "none") ?: "none"}; " +
+                "failureClass=${prefs.getString("failureClass", "none") ?: "none"} " +
+                "bootWatchdog=${prefs.getString("bootWatchdog", "not-run") ?: "not-run"} " +
+                "bluetoothMusic=${prefs.getString("bluetoothMusic", "not-attempted") ?: "not-attempted"}; " +
                 "startActivity-returned does not prove the OEM displayed the app."
         }
     }.getOrDefault("Boot diagnostics unavailable.")

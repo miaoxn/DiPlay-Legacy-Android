@@ -252,7 +252,7 @@ class NightModeSettingsTest {
         shadowOf(Looper.getMainLooper()).idle()
     }
 
-    private fun button(title: Int) = views(page).filterIsInstance<Button>().single {
+    private fun button(title: Int) = views(page).filterIsInstance<Button>().first {
         it.text.startsWith(activity.getString(title) + " · ")
     }
 

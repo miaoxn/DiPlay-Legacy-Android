@@ -175,8 +175,6 @@ class HsaeRfcommStream private constructor(
 
     companion object {
         private const val TAG = "HsaeRfcommStream"
-        private const val SERVICE_ACTION = "com.anwsdk.service.AnwPhoneLink"
-        private const val SERVICE_PACKAGE = "com.anwsdk.service"
         private val EMPTY = ByteArray(0)
 
         fun connect(context: Context, address: String, uuidString: String): BlockingDuplexByteStream {
@@ -194,12 +192,12 @@ class HsaeRfcommStream private constructor(
                 }
             }
 
-            val intent = Intent(SERVICE_ACTION).apply {
-                setPackage(SERVICE_PACKAGE)
+            val intent = Intent(ANW_PHONE_LINK_ACTION).apply {
+                setPackage(ANW_PHONE_LINK_PACKAGE)
             }
             val bound = context.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
             if (!bound) {
-                throw IOException("Could not bind to AnwSdkService ($SERVICE_ACTION)")
+                throw IOException("Could not bind to AnwSdkService ($ANW_PHONE_LINK_ACTION)")
             }
 
             if (!latch.await(5000L, TimeUnit.MILLISECONDS)) {

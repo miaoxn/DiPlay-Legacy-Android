@@ -6,6 +6,22 @@ import org.junit.Test
 
 class AudioChannelMappingTest {
     @Test
+    fun musicDownlinkExperimentChangesOnlyTelephonyInBothMappingModes() {
+        for (mode in AudioChannelMappingMode.entries) {
+            assertEquals(
+                AudioChannelSelection(AudioChannel.PHONE, AudioContentType.SPEECH, AudioManager.STREAM_MUSIC),
+                AudioChannelMapper.map("telephony", 100, mode, telephonyDownlinkViaMusic = true),
+            )
+            for (audioType in listOf("media", "speechRecognition", "alert", "default", "unknown")) {
+                assertEquals(
+                    AudioChannelMapper.map(audioType, 100, mode),
+                    AudioChannelMapper.map(audioType, 100, mode, telephonyDownlinkViaMusic = true),
+                )
+            }
+        }
+    }
+
+    @Test
     fun mobileCompatibleMappingMatchesTheOriginalRouting() {
         assertMapped(
             mode = AudioChannelMappingMode.MOBILE_COMPATIBLE,
@@ -13,6 +29,7 @@ class AudioChannelMappingTest {
             payloadType = 100,
             channel = AudioChannel.PHONE,
             contentType = AudioContentType.SPEECH,
+            streamType = AudioManager.STREAM_VOICE_CALL,
         )
         assertMapped(
             mode = AudioChannelMappingMode.MOBILE_COMPATIBLE,
@@ -20,6 +37,7 @@ class AudioChannelMappingTest {
             payloadType = 100,
             channel = AudioChannel.ASSISTANT,
             contentType = AudioContentType.SPEECH,
+            streamType = AudioManager.STREAM_VOICE_CALL,
         )
         assertMapped(
             mode = AudioChannelMappingMode.MOBILE_COMPATIBLE,
@@ -57,6 +75,7 @@ class AudioChannelMappingTest {
             payloadType = 100,
             channel = AudioChannel.PHONE,
             contentType = AudioContentType.SPEECH,
+            streamType = AudioManager.STREAM_VOICE_CALL,
         )
         assertMapped(
             mode = AudioChannelMappingMode.AUTOMOTIVE_BUS,
@@ -64,6 +83,7 @@ class AudioChannelMappingTest {
             payloadType = 100,
             channel = AudioChannel.ASSISTANT,
             contentType = AudioContentType.SPEECH,
+            streamType = AudioManager.STREAM_VOICE_CALL,
         )
         listOf("default", "alert").forEach { audioType ->
             assertMapped(

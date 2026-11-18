@@ -43,22 +43,66 @@ class DiPlayUpdateClientTest {
         assertEquals(listOf("https://example.com/test.apk"), DiPlayUpdateClient.downloadCandidates("https://example.com/test.apk"))
     }
 
-    @Test fun checksumIsFetchedFromTheCanonicalUrlOnly() {
-        // The .sha256 anchors the APK's integrity: a mirror that serves the
-        // APK must never also get to serve the hash it is checked against.
+    @Test fun checksumIsFetchedFromTheCanonicalUrlWithMirrorFallback() {
         val url = "$prefix$name.sha256"
-        assertEquals(listOf(url), DiPlayUpdateClient.checksumCandidates(url))
+        assertEquals(
+            listOf(url, "https://ghproxy.net/$url", "https://gh-proxy.com/$url"),
+            DiPlayUpdateClient.checksumCandidates(url)
+        )
     }
 
-    @Test fun approvedHostsAllowGitHubAndDomesticMirrors() {
+    @Test fun approvedHostsAllowGitHubDomesticMirrorsAndGitee() {
         assertTrue(DiPlayUpdateClient.isApprovedHost("api.github.com"))
         assertTrue(DiPlayUpdateClient.isApprovedHost("github.com"))
         assertTrue(DiPlayUpdateClient.isApprovedHost("objects.githubusercontent.com"))
         assertTrue(DiPlayUpdateClient.isApprovedHost("release-assets.githubusercontent.com"))
         assertTrue(DiPlayUpdateClient.isApprovedHost("ghproxy.net"))
         assertTrue(DiPlayUpdateClient.isApprovedHost("gh-proxy.com"))
+        assertTrue(DiPlayUpdateClient.isApprovedHost("gitee.com"))
+        assertTrue(DiPlayUpdateClient.isApprovedHost("api.gitee.com"))
         assertFalse(DiPlayUpdateClient.isApprovedHost("evil.com"))
         assertFalse(DiPlayUpdateClient.isApprovedHost("notgithub.com"))
+        assertFalse(DiPlayUpdateClient.isApprovedHost("notgitee.com"))
+    }
+
+    @Test fun giteeFallbackOnlyRunsWhenGitHubDiscoveryFails() {
+        val githubRelease = DiPlayUpdateClient.Release("v0.2.34", "notes", name,
+            prefix + name, "$prefix$name.sha256", 1024)
+        var giteeCalls = 0
+        assertEquals(githubRelease, DiPlayUpdateClient.latestWithFallback(
+            github = { githubRelease },
+            gitee = { giteeCalls++; githubRelease },
+        ))
+        assertEquals(0, giteeCalls)
+        assertNull(DiPlayUpdateClient.latestWithFallback(
+            github = { null },
+            gitee = { giteeCalls++; githubRelease },
+        ))
+        assertEquals(0, giteeCalls)
+    }
+
+    @Test fun giteeFallbackServesReleaseWhenGitHubThrows() {
+        val giteePrefix = "https://gitee.com/JingRuirui/DiPlay-Legacy-Android/releases/download/v0.2.34/"
+        val giteeRelease = DiPlayUpdateClient.Release("v0.2.34", "notes", name,
+            giteePrefix + name, "$giteePrefix$name.sha256", 1024)
+        assertEquals(giteeRelease, DiPlayUpdateClient.latestWithFallback(
+            github = { throw java.io.IOException("Update server returned HTTP 404") },
+            gitee = { giteeRelease },
+        ))
+    }
+
+    @Test fun bothSourcesFailingSurfacesGiteeErrorWithGitHubSuppressed() {
+        val githubFailure = java.io.IOException("Update server returned HTTP 404")
+        try {
+            DiPlayUpdateClient.latestWithFallback(
+                github = { throw githubFailure },
+                gitee = { throw java.io.IOException("Gitee release has no valid ID") },
+            )
+            throw AssertionError("Both sources failing should throw")
+        } catch (expected: java.io.IOException) {
+            assertTrue(expected.message!!.contains("Gitee"))
+            assertTrue(expected.suppressed.contains(githubFailure))
+        }
     }
 
     @Test fun acceptsOnlyHigherStableVersion() {

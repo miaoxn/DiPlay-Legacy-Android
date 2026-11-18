@@ -83,24 +83,35 @@ object SettingsWidgets {
         button.setButtonDrawable(radioDrawable(context, theme))
     }
 
-    /** Self-drawn switch thumb and track in theme colors; Switch tint lists need API 23+. */
+    /**
+     * Self-drawn switch thumb and track in theme colors; Switch tint lists
+     * need API 23+. Disabled states come first and reuse the same shapes
+     * dimmed, so a disabled switch still reads as disabled instead of
+     * showing full theme colors; enabled rendering is unchanged.
+     */
     fun styleSwitch(switch: Switch, context: Context, theme: SettingsTheme) {
-        fun thumb(color: Int) = GradientDrawable().apply {
+        fun thumb(color: Int, dimmed: Boolean = false) = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             setColor(color)
             setSize(theme.dp(context, 24), theme.dp(context, 24))
+            if (dimmed) alpha = 128
         }
         switch.thumbDrawable = StateListDrawable().apply {
+            addState(intArrayOf(-android.R.attr.state_enabled, android.R.attr.state_checked), thumb(Color.WHITE, dimmed = true))
+            addState(intArrayOf(-android.R.attr.state_enabled), thumb(theme.textSecondary, dimmed = true))
             addState(intArrayOf(android.R.attr.state_checked), thumb(Color.WHITE))
             addState(intArrayOf(), thumb(theme.textSecondary))
         }
-        fun track(color: Int) = GradientDrawable().apply {
+        fun track(color: Int, dimmed: Boolean = false) = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = theme.dp(context, 14).toFloat()
             setColor(color)
             setSize(theme.dp(context, 46), theme.dp(context, 28))
+            if (dimmed) alpha = 128
         }
         switch.trackDrawable = StateListDrawable().apply {
+            addState(intArrayOf(-android.R.attr.state_enabled, android.R.attr.state_checked), track(theme.accentTrack, dimmed = true))
+            addState(intArrayOf(-android.R.attr.state_enabled), track(theme.trackOff, dimmed = true))
             addState(intArrayOf(android.R.attr.state_checked), track(theme.accentTrack))
             addState(intArrayOf(), track(theme.trackOff))
         }
@@ -145,16 +156,24 @@ object SettingsWidgets {
             isChecked = checked
             this.contentDescription = contentDescription
             isEnabled = enabled
+            // textOn/textOff exist since API 14: clearing them on every
+            // version keeps the Holo ON/OFF text out of the track on old
+            // head units. showText only exists on Lollipop and above.
+            textOn = ""
+            textOff = ""
             if (realSdkInt() >= android.os.Build.VERSION_CODES.LOLLIPOP) {
                 showText = false
-                textOn = ""
-                textOff = ""
             }
             if (theme.isOverlay) {
                 styleSwitch(this, context, theme)
             } else {
                 minHeight = theme.dp(context, 56)
-                if (realSdkInt() >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                if (realSdkInt() < android.os.Build.VERSION_CODES.M) {
+                    // Below API 23 the platform cannot tint the switch, so
+                    // draw it in theme colors like the menu instead of the
+                    // ROM's stock switch.
+                    styleSwitch(this, context, theme)
+                } else {
                     buttonTintList = ColorStateList.valueOf(theme.accent)
                 }
             }

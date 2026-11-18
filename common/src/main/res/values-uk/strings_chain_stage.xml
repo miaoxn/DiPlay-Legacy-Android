@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chain_hint_bluetooth">Переконайтеся, що Bluetooth-адаптер підключено, а iPhone спряжено.</string>
+    <string name="chain_hint_hotspot">Перевірьте точку доступу та вимкніть «Приватну адресу Wi-Fi» на iPhone для цієї мережі.</string>
+    <string name="chain_hint_usb_permission">Перепідключіть кабель і дозвольте доступ USB у запиті.</string>
+    <string name="chain_stage_entered">Етап розпочато · %1$d с</string>
+    <string name="chain_stage_waiting">Етап чекає вже %1$d с · якщо не змінюється, сфотографуйте цей екран</string>
+    <string name="chain_step_current">[%1$d/%2$d] %3$s · очікування %4$s</string>
+    <string name="chain_step_failed">[%1$d/%2$d] %3$s · збій · очікування %4$s</string>
+    <string name="chain_step_wired_01">USB підключено</string>
+    <string name="chain_step_wired_02">Дозвіл USB</string>
+    <string name="chain_step_wired_03">Сесія iAP2</string>
+    <string name="chain_step_wired_04">Конфіг. NCM</string>
+    <string name="chain_step_wired_05">Міст NCM</string>
+    <string name="chain_step_wired_06">Хост USBMUX</string>
+    <string name="chain_step_wired_07">Спряження</string>
+    <string name="chain_step_wired_08">Служба CarKit</string>
+    <string name="chain_step_wired_09">Канал iAP2</string>
+    <string name="chain_step_wired_10">VPN привʼязано</string>
+    <string name="chain_step_wired_11">Транспорт підключено</string>
+    <string name="chain_step_wired_12">MFi готовий</string>
+    <string name="chain_step_wired_13">Слухач привʼязано</string>
+    <string name="chain_step_wired_14">StartSession надіслано</string>
+    <string name="chain_step_wired_15">mDNS відповіли</string>
+    <string name="chain_step_wired_16">Сесія активна</string>
+    <string name="chain_step_wireless_01">Адаптер Bluetooth</string>
+    <string name="chain_step_wireless_02">Bluetooth увімкнено</string>
+    <string name="chain_step_wireless_03">Підключення RFCOMM</string>
+    <string name="chain_step_wireless_04">Канал iAP2</string>
+    <string name="chain_step_wireless_05">Запуск точки доступу</string>
+    <string name="chain_step_wireless_06">Точка доступу готова</string>
+    <string name="chain_step_wireless_07">Мовлення mDNS</string>
+    <string name="chain_step_wireless_08">Тунель відкрито</string>
+    <string name="chain_step_wireless_09">Тунель готовий</string>
+    <string name="chain_step_wireless_10">Передачу завершено</string>
+    <string name="chain_step_wireless_11">Транспорт підключено</string>
+    <string name="chain_step_wireless_12">Сесія активна</string>
+</resources>

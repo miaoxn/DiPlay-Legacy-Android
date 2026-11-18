@@ -17,7 +17,9 @@ import java.net.NetworkInterface
  * root, in the arrangement proven on those units:
  *
  *  1. kill stale hostapd/dnsmasq and stale lease state;
- *  2. force the framework Wi-Fi radio on (`svc wifi enable`) so wlan0 exists;
+ *  2. force the framework Wi-Fi radio on (`svc wifi enable`, falling back to
+ *     the privileged app_process helper when svc leaves the radio off —
+ *     issue #301(a)) so wlan0 exists;
  *  3. generate hostapd.conf from the configured SSID/password/channel, copy
  *     it to the standard /data/misc/wifi/hostapd.conf, and start the system's
  *     /system/bin/hostapd;
@@ -34,6 +36,7 @@ class HostapdHotspotManager(
     private val ssid: String,
     private val passphrase: String,
     private val channel: Int,
+    private val appleVendorIe: Boolean = false,
     private val onDiagnostic: (String) -> Unit = {},
     private val isCancelled: () -> Boolean = { false },
 ) : WirelessHotspotManager {
@@ -44,8 +47,51 @@ class HostapdHotspotManager(
     private var started = false
     private var wifiWasOn = true
     private var confirmedClientCount: Int? = null
+    // Issue #313: the hotspot-ready Bluetooth reset can fail (neither root
+    // nor adapter.disable works) while the phone only joins later. Remember
+    // that so the first observed lease can retry it once. Units whose
+    // initial reset worked never see this path.
+    private var btResetFailed = false
+    private var btResetRetried = false
+    // Issue #337: the foreground probe runs once per manager, on the first
+    // launch failure only — every retry fails identically on the affected
+    // units, and each probe costs ~2s of foreground daemon time.
+    private var foregroundProbeDone = false
 
-    override fun start(timeoutMillis: Long): WirelessHotspotInfo {
+    /**
+     * Set once [start] has changed anything on the head unit (killed stale
+     * processes, switched Wi-Fi, written the config). [teardown] undoes system
+     * state only when this is set, so closing a manager that never started does
+     * not kill the unit's own processes or take wlan0 down.
+     */
+    @Volatile
+    private var touchedSystem = false
+
+    /** Issues #330/#348: pause inside the failure-path radio reload cycle. */
+    private val wifiReloadSettleMillis = 1_000L
+
+    override fun start(timeoutMillis: Long): WirelessHotspotInfo = try {
+        startHotspot(timeoutMillis)
+    } catch (error: Throwable) {
+        // A failed or cancelled start must not leave hostapd/dnsmasq running
+        // or the passphrase-bearing config on disk, and it must never leave
+        // the interface downed or the radio disabled behind it (issues
+        // #330/#348): on the affected Honda firmware, a failure teardown
+        // that downs wlan0 / disables Wi-Fi leaves the interface in a state
+        // where no later bind succeeds until the head unit reboots — proven
+        // by the reporter's control experiment (after a failed
+        // current-version start, even 0.2.97 could not bind until a
+        // reboot). Killing the daemons alone is not enough either: the
+        // contributor's Civic testing shows the residue sits in the
+        // driver's runtime state and only a radio reload flushes it, so
+        // the failure teardown cycles Wi-Fi once and leaves it on, freshly
+        // loaded. The full state restoration stays with close(), where
+        // the stop is deliberate.
+        teardown(restoreInterfaceState = false)
+        throw error
+    }
+
+    private fun startHotspot(timeoutMillis: Long): WirelessHotspotInfo {
         check(Looper.myLooper() != Looper.getMainLooper()) {
             "HostapdHotspotManager.start must not run on the main thread"
         }
@@ -85,6 +131,7 @@ class HostapdHotspotManager(
             )
         }
 
+        touchedSystem = true
         RootShell.run(HostapdConfig.killStaleScript(), 10_000)
         checkActive()
 
@@ -94,17 +141,31 @@ class HostapdHotspotManager(
             RootShell.run("svc wifi enable", 10_000)
             awaitInterface(deadlineMillis(deadline, 15_000)) { interfaceExists() }
             if (closed || isCancelled()) throw InterruptedIOException("Hostapd hotspot startup cancelled")
+            var helperEvidence = ""
+            if (!interfaceExists()) {
+                // Issue #301(a): on some firmware (Civic 4.2.2) `svc` is a hollow
+                // stub — it exits 0 but never powers the radio. Fall back to the
+                // privileged app_process helper, which enables the radio through
+                // the framework API directly; hostapd still owns the AP itself.
+                // The helper only runs after svc already failed, so it cannot
+                // change the outcome on units where svc works.
+                val helper = WifiRadioHelper.run(appContext)
+                helperEvidence = "; helper ok=${helper.ok} (${helper.raw})"
+                onDiagnostic("hostapd: svc left ${HostapdConfig.INTERFACE_NAME} absent; helper ok=${helper.ok} (${helper.raw})")
+                awaitInterface(deadlineMillis(deadline, 15_000)) { interfaceExists() }
+                if (closed || isCancelled()) throw InterruptedIOException("Hostapd hotspot startup cancelled")
+            }
             if (!interfaceExists()) {
                 val netdevs = RootShell.run("ls /sys/class/net 2>/dev/null", 3_000)
                     .output.trim().replace('\n', ' ').take(200)
                 throw IOException(
                     "hostapd: ${HostapdConfig.INTERFACE_NAME} did not appear after enabling Wi-Fi " +
-                        "(netdevs: $netdevs)",
+                        "(netdevs: $netdevs$helperEvidence)",
                 )
             }
         }
 
-        val conf = HostapdConfig.renderConf(ssid, passphrase, channel)
+        val conf = HostapdConfig.renderConf(ssid, passphrase, channel, appleVendorIe)
         // Deploy by staging the file in app-private storage and copying it
         // into place as root — the recipe proven on-device (issue #301). The
         // earlier heredoc write depends on the root shell's temp directory,
@@ -114,13 +175,24 @@ class HostapdHotspotManager(
         try {
             staged.writeText(conf)
         } catch (error: Exception) {
+            staged.delete() // do not leave a partly written copy of the passphrase behind
             throw IOException("hostapd: hostapd_full.conf deploy failed: could not stage the config: ${error.message}")
         }
-        val deployed = RootShell.run(
-            "mkdir -p /data/misc/wifi; cp ${staged.absolutePath} ${HostapdConfig.TMP_CONF_PATH}" +
-                " && cp ${HostapdConfig.TMP_CONF_PATH} ${HostapdConfig.CONF_PATH}",
-            10_000,
-        )
+        val deployed = try {
+            RootShell.run(
+                "mkdir -p /data/misc/wifi; cp ${staged.absolutePath} ${HostapdConfig.TMP_CONF_PATH}" +
+                    " && cp ${HostapdConfig.TMP_CONF_PATH} ${HostapdConfig.CONF_PATH}",
+                10_000,
+            )
+        } finally {
+            // The app-private staging copy holds the WPA passphrase: drop it as
+            // soon as it has been handed over (or the hand-over failed).
+            staged.delete()
+        }
+        // The intermediate copy in /data/local/tmp is readable by the adb shell
+        // user and only exists for the copy above; hostapd reads CONF_PATH.
+        // A separate command keeps the deploy exit status from being masked.
+        RootShell.run(HostapdConfig.removeStagedConfScript(), 5_000)
         if (!deployed.success) {
             throw IOException("hostapd: hostapd_full.conf deploy failed: ${deployed.output.trim().take(200)}")
         }
@@ -129,20 +201,94 @@ class HostapdHotspotManager(
         // Release any half-up state before hostapd claims the interface
         // (the proven on-device recipe does the same).
         RootShell.run("ifconfig ${HostapdConfig.INTERFACE_NAME} down 2>/dev/null", 5_000)
-        val launched = RootShell.run(
-            "$hostapdPath -B ${HostapdConfig.CONF_PATH} >${HostapdConfig.HOSTAPD_LOG_PATH} 2>&1 & sleep 1",
-            15_000,
-        )
-        if (!launched.success || hostapdProcessCount() < 1) {
+        // Issue #337: echo the daemon's pid (`echo $!`) — the hostapd
+        // invocation itself is byte-identical to the proven recipe, but the
+        // pid lets a later failure tell whether THIS hostapd died, was
+        // killed, or never started. The shell's exit code is sleep's, so it
+        // says nothing about hostapd; the pid is the real witness.
+        val launchCmd =
+            "$hostapdPath -B ${HostapdConfig.CONF_PATH} >${HostapdConfig.HOSTAPD_LOG_PATH} 2>&1 & echo \$!; sleep 1"
+        val launched = RootShell.run(launchCmd, 15_000)
+        val launchedPid = HostapdConfig.parseLaunchedPid(launched.output)
+        var running = false
+        val checkDeadline = System.nanoTime() + 3_000_000_000L
+        while (System.nanoTime() < checkDeadline) {
+            if (hostapdProcessCount() >= 1) {
+                running = true
+                break
+            }
+            Thread.sleep(300)
+        }
+        if (!launched.success || !running) {
+            // Issue #337: the old failure line only carried hapd.log, which
+            // is empty on the reporter's unit — so "never started", "died
+            // instantly", "killed" and "misjudged by ps parsing" were
+            // indistinguishable. Gather the evidence that splits them: the
+            // launch command, the echoed pid, whether that pid still exists
+            // (via /proc, which does not depend on `ps` dialects), the
+            // pid's `ps` line, the launch shell's own words, and whether
+            // hapd.log is missing, empty, or has content. NOTE: a -B
+            // daemon's exit code/signal cannot be recovered after the fact
+            // (init reaps it), so pid-alive is the substitute witness — no
+            // exit code is claimed here.
+            val psLine = launchedPid?.let { pid ->
+                HostapdConfig.psLineForPid(RootShell.run("ps", 5_000).output, pid)
+            }
+            val procCheck = launchedPid?.let { pid ->
+                RootShell.run("ls -d /proc/$pid 2>/dev/null", 3_000)
+            }
+            val pidAlive: Boolean? = when {
+                procCheck == null -> null
+                procCheck.exitCode == null -> null
+                else -> procCheck.success
+            }
+            val logStat = RootShell.run("ls -l ${HostapdConfig.HOSTAPD_LOG_PATH} 2>/dev/null", 3_000)
+            val logBytes = logStat.output.trim().split(Regex("\\s+")).getOrNull(4)?.toLongOrNull()
             // `tail` does not exist on minimal ROMs (issue #308): read the
             // whole log (it is truncated fresh at every launch) and keep its
             // end, where hostapd puts the failure.
             val log = RootShell.run("cat ${HostapdConfig.HOSTAPD_LOG_PATH} 2>/dev/null", 5_000)
-            throw IOException(
-                "hostapd: hostapd did not stay up; hapd.log=${log.output.trim().replace('\n', ' ').takeLast(300)}",
-            )
+            // Issue #337: on the reporter's unit every launch dies within 1s
+            // AND hapd.log is missing (not empty) — the daemon never got far
+            // enough to write a byte, so the -B evidence cannot say why.
+            // Run the same binary once in the foreground and capture its own
+            // words and exit code: a config error, a driver error, or an unwritable log
+            // directory all print here. Bounded to ~2s, killed afterwards,
+            // and the next start's killStale cleans up if the kill misses.
+            // Once per manager: later retries fail identically.
+            // The probe asks the daemon to write its OWN log file (-f) at
+            // debug verbosity (-dd) instead of relying on shell redirection:
+            // on the affected Honda units both redirected logs (hapd.log and
+            // the earlier probe log) came back empty on every failure while
+            // the daemon demonstrably started and died — its messages never
+            // reached stdout/stderr there.
+            var fgProbe = ""
+            if (!foregroundProbeDone) {
+                foregroundProbeDone = true
+                val probeCmd =
+                    "rm -f ${HostapdConfig.FG_PROBE_LOG_PATH}; " +
+                    "$hostapdPath -dd -f ${HostapdConfig.FG_PROBE_LOG_PATH} ${HostapdConfig.CONF_PATH} & FG=\$!; sleep 2; " +
+                        "if kill -0 \$FG 2>/dev/null; then echo FG_ALIVE; kill \$FG; sleep 1; else wait \$FG 2>/dev/null; echo FG_DEAD FG_EXIT=\$?; fi; " +
+                        "ls -ld /data/local/tmp 2>/dev/null; cat ${HostapdConfig.FG_PROBE_LOG_PATH} 2>/dev/null"
+                val probeResult = runCatching { RootShell.run(probeCmd, 10_000) }.getOrNull()
+                fgProbe = probeResult?.output?.trim()?.replace('\n', ' ')?.take(600) ?: "unavailable"
+            }
+            val evidence = buildString {
+                append("cmd=").append(launchCmd)
+                append("; pid=").append(launchedPid ?: "unknown")
+                append("; pidAlive=").append(pidAlive?.toString() ?: "unknown")
+                append("; psLine=").append(psLine?.take(160) ?: if (launchedPid == null) "unknown" else "none")
+                append("; launchOk=").append(launched.success)
+                append("; launchExit=").append(launched.exitCode ?: "none")
+                append("; launchOut=").append(launched.output.trim().replace('\n', ' ').take(200))
+                append("; hapdBytes=").append(logBytes ?: "missing")
+                append("; hapd.log=").append(log.output.trim().replace('\n', ' ').takeLast(300))
+                if (fgProbe.isNotEmpty()) append("; fgProbe=").append(fgProbe)
+            }
+            onDiagnostic("hostapd: launch failed evidence: $evidence")
+            throw IOException("hostapd: hostapd did not stay up; $evidence")
         }
-        onDiagnostic("hostapd: hostapd is up on ${HostapdConfig.INTERFACE_NAME}")
+        onDiagnostic("hostapd: hostapd is up on ${HostapdConfig.INTERFACE_NAME} pid=${launchedPid ?: "unknown"}")
 
         var addressed = false
         var lastSetOutput = ""
@@ -178,7 +324,14 @@ class HostapdHotspotManager(
         onDiagnostic(
             "hostapd: hotspot ready iface=${HostapdConfig.INTERFACE_NAME} addr=${HostapdConfig.HOST_ADDRESS}",
         )
-        resetBluetoothStack()
+        BluetoothStackReset.reset(
+            tag = "hostapd",
+            isCancelled = { closed || isCancelled() },
+            onDiagnostic = { msg ->
+                if (msg.contains("bluetooth reset unavailable")) btResetFailed = true
+                onDiagnostic(msg)
+            },
+        )
 
         val hostAddress = InetAddress.getByName(HostapdConfig.HOST_ADDRESS)
         val mac = runCatching {
@@ -214,10 +367,24 @@ class HostapdHotspotManager(
 
     override fun joinedClientCount(): Int? {
         if (!started || closed) return confirmedClientCount
+        val previous = confirmedClientCount
         val leases = RootShell.run("cat ${HostapdConfig.LEASES_PATH} 2>/dev/null", 5_000)
         if (!leases.success && leases.output.isBlank()) return confirmedClientCount
         val count = HostapdConfig.activeLeases(leases.output, System.currentTimeMillis() / 1_000).size
         confirmedClientCount = count
+        // Issue #313: the phone joining (leases 0/null -> positive) is the
+        // first moment a retry can help — the initial reset failed before
+        // the phone was even on the network. One shot only, so a healthy
+        // unit never gets a second Bluetooth flap mid-connect.
+        if (!btResetRetried && btResetFailed && (previous == null || previous == 0) && count > 0) {
+            btResetRetried = true
+            onDiagnostic("hostapd: phone joined after a failed bluetooth reset; retrying the reset once")
+            BluetoothStackReset.reset(
+                tag = "hostapd-lease",
+                isCancelled = { closed || isCancelled() },
+                onDiagnostic = onDiagnostic,
+            )
+        }
         return count
     }
 
@@ -229,14 +396,63 @@ class HostapdHotspotManager(
     override fun close() {
         if (closed) return
         closed = true
-        if (!started && !wifiWasOn) return
+        teardown()
+    }
+
+    /**
+     * Stops what [start] began and removes what it wrote: hostapd/dnsmasq, the
+     * generated configuration (it carries the WPA passphrase), logs and lease
+     * state, and Wi-Fi again if this backend had to switch it on. Safe to call
+     * more than once, and a no-op when [start] never changed anything.
+     */
+    private fun teardown(restoreInterfaceState: Boolean = true) {
+        if (!touchedSystem) return
+        touchedSystem = false
         runCatching {
-            RootShell.run(
-                HostapdConfig.killStaleScript() + "; ifconfig ${HostapdConfig.INTERFACE_NAME} down 2>/dev/null",
-                10_000,
-            )
-            if (!wifiWasOn) {
+            if (restoreInterfaceState) {
+                RootShell.run(
+                    HostapdConfig.killStaleScript() + "; ifconfig ${HostapdConfig.INTERFACE_NAME} down 2>/dev/null" +
+                        "; " + HostapdConfig.removeGeneratedFilesScript(),
+                    10_000,
+                )
+                if (!wifiWasOn) {
+                    RootShell.run("svc wifi disable", 10_000)
+                }
+            } else {
+                // Failure path (issues #330/#348): kill this backend's
+                // daemons and remove the generated files, never down the
+                // interface — then reload the radio (disable, brief pause,
+                // enable) so the driver drops whatever AP-mode residue the
+                // failed bind left in its runtime state, and leave it on:
+                // that freshly loaded state is what the next start binds
+                // against. See start() for the field evidence.
+                RootShell.run(
+                    HostapdConfig.killStaleScript() + "; " + HostapdConfig.removeGeneratedFilesScript(),
+                    10_000,
+                )
+                // IKVWMF: the reload used to be fire-and-forget. On Honda
+                // 4.2.2 firmware `svc` can be a hollow stub (issue #301(a)
+                // proved it for enable), so a reload that never happened
+                // left the driver residue behind and every later hostapd
+                // died before writing a byte — until a reboot. Verify each
+                // half: fall back to the privileged helper when `svc`
+                // demonstrably did not move the radio, and wait for the
+                // interface to come back before the next start binds.
                 RootShell.run("svc wifi disable", 10_000)
+                runCatching { Thread.sleep(wifiReloadSettleMillis) }
+                if (readFrameworkWifiOn()) {
+                    val helper = WifiRadioHelper.run(appContext, WifiRadioHelper.RadioAction.DISABLE)
+                    onDiagnostic("hostapd: svc wifi disable left the radio on; helper disable ok=${helper.ok} (${helper.raw})")
+                    runCatching { Thread.sleep(wifiReloadSettleMillis) }
+                }
+                RootShell.run("svc wifi enable", 10_000)
+                awaitInterface(15_000) { interfaceExists() }
+                if (!interfaceExists()) {
+                    val helper = WifiRadioHelper.run(appContext, WifiRadioHelper.RadioAction.ENABLE)
+                    onDiagnostic("hostapd: svc wifi enable left ${HostapdConfig.INTERFACE_NAME} absent after reload; helper ok=${helper.ok} (${helper.raw})")
+                    awaitInterface(15_000) { interfaceExists() }
+                }
+                onDiagnostic("hostapd: radio reload finished interfacePresent=${interfaceExists()}")
             }
         }
         started = false
@@ -250,13 +466,13 @@ class HostapdHotspotManager(
             .output.contains(HostapdConfig.INTERFACE_NAME)
 
     /**
-     * Live hostapd processes. Counted here instead of with `wc -l` in the
-     * shell: minimal ROMs ship neither `wc` nor `tail`, and the pipeline
-     * version silently reported "not up" for a running hostapd (issue #308).
+     * Live hostapd processes. Counted here instead of with `wc -l` or `grep` in the
+     * shell: minimal ROMs (e.g. Android 4.2 toolbox) ship neither `wc`, `tail` nor `grep`,
+     * and a shell pipeline silently fails on those units (issues #308, #337).
      */
     private fun hostapdProcessCount(): Int {
-        val result = RootShell.run("ps | grep hostapd | grep -v grep", 5_000)
-        return result.output.lineSequence().count { it.isNotBlank() }
+        val result = RootShell.run("ps", 5_000)
+        return HostapdConfig.countHostapdProcesses(result.output)
     }
 
     /** True when the AP address is on the interface; parsed here, not with a shell pipeline. */
@@ -293,50 +509,4 @@ class HostapdHotspotManager(
      * bootstrap that follows hotspot-ready needs a fresh stack. Any failure
      * here is logged and the connection attempt continues.
      */
-    private fun resetBluetoothStack() {
-        val adapter = try {
-            BluetoothAdapter.getDefaultAdapter()
-        } catch (_: Exception) {
-            null
-        } catch (_: Error) {
-            null
-        } ?: run {
-            onDiagnostic("hostapd: bluetooth reset skipped (no adapter)")
-            return
-        }
-        if (!adapter.isEnabled) {
-            onDiagnostic("hostapd: bluetooth reset skipped (adapter off)")
-            return
-        }
-        var disabled = RootShell.run("svc bluetooth disable", 10_000).success
-        if (!disabled) {
-            disabled = runCatching { adapter.disable() }.getOrDefault(false)
-        }
-        if (!disabled) {
-            onDiagnostic("hostapd: bluetooth reset unavailable (neither root nor adapter.disable succeeded)")
-            return
-        }
-        val offDeadline = System.nanoTime() + 5_000_000_000L
-        while (adapter.state != BluetoothAdapter.STATE_OFF && System.nanoTime() < offDeadline) {
-            if (closed || isCancelled()) return
-            Thread.sleep(200)
-        }
-        if (adapter.state != BluetoothAdapter.STATE_OFF) {
-            onDiagnostic("hostapd: bluetooth reset skipped (adapter did not turn off)")
-            return
-        }
-        val enabled = RootShell.run("svc bluetooth enable", 10_000).success
-        if (!enabled) {
-            runCatching { adapter.enable() }
-        }
-        val onDeadline = System.nanoTime() + 10_000_000_000L
-        while (!adapter.isEnabled && System.nanoTime() < onDeadline) {
-            if (closed || isCancelled()) return
-            Thread.sleep(200)
-        }
-        onDiagnostic(
-            if (adapter.isEnabled) "hostapd: bluetooth stack reset done" else
-                "hostapd: bluetooth stack reset done (adapter still coming up)",
-        )
-    }
 }

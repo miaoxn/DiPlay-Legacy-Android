@@ -54,11 +54,27 @@ class NcmUsbBridge internal constructor(
     /** Issue #137: in-flight write start (nanoTime; 0 = idle), read by the wedge watchdog. */
     @Volatile private var writeInFlightSinceNs = 0L
     private val writeWatchdogStarted = AtomicBoolean(false)
+    private val stallWatchdogStarted = AtomicBoolean(false)
+    private var stallCompletedSnapshot = -1
+    private var stallSnapshotNs = 0L
     private val writeWatchdogFired = AtomicBoolean(false)
     private var inboundFrameSeen = false
     private var consecutiveWriteFailures = 0
+    /** Issue #352-Q4 & #368: bulk-OUT queue-vs-wire split (frames in, chunks out, bytes out). */
+    private var ncmWriteEnqueuedFrames = 0
+    private var ncmWriteSubmittedChunks = 0
+    private var ncmWriteCompletedChunks = 0
+    private var ncmWriteSuccessBytes = 0
+    @Volatile var lastBulkInSuccessNs = 0L
+        private set
+    @Volatile var lastBulkOutSuccessNs = 0L
+        private set
+    val bulkInSuccessAgoMs: Long get() = if (lastBulkInSuccessNs == 0L) -1L else (System.nanoTime() - lastBulkInSuccessNs) / 1_000_000
+    val bulkOutSuccessAgoMs: Long get() = if (lastBulkOutSuccessNs == 0L) -1L else (System.nanoTime() - lastBulkOutSuccessNs) / 1_000_000
+    val writeSummary: String get() = "enqueued=$ncmWriteEnqueuedFrames submitted=$ncmWriteSubmittedChunks completed=$ncmWriteCompletedChunks bytes=$ncmWriteSuccessBytes"
     /** Issue #279: the data-interface reset is attempted once per failure run. */
     private var interfaceResetAttempted = false
+    private var interfaceReclaimAttempted = false
     private val frames = ArrayDeque<ByteArray>()
     private var queuedBytes = 0
     private var buffered = ByteArray(0)
@@ -92,6 +108,7 @@ class NcmUsbBridge internal constructor(
     /** Wraps one Ethernet frame in one NTB16 block and writes it to bulk OUT. */
     fun send(frame: ByteArray, timeoutMillis: Int) = synchronized(writeLock) {
         if (closed || isAbortedOrDetached) return@synchronized
+        ncmWriteEnqueuedFrames++
         checkOpen()
         require(timeoutMillis > 0) { "timeoutMillis must be positive" }
         val sequence = synchronized(stateLock) {
@@ -100,14 +117,21 @@ class NcmUsbBridge internal constructor(
         }
         val block = Ntb16Codec.build(frame, sequence)
         ensureWriteWatchdog()
+        ensureStallWatchdog()
         writeInFlightSinceNs = System.nanoTime()
         var failedAfterNanos = 0L
         var errno = 0
         val transferred = try {
             writeUsbChunks(block.size, realSdkInt(), timeoutMillis) { offset, count, timeout ->
                 val started = System.nanoTime()
+                ncmWriteSubmittedChunks++
                 val written = sharedConnection.bulkTransfer(outEndpoint, block, offset, count, timeout)
-                if (written > 0) return@writeUsbChunks written
+                if (written > 0) {
+                    lastBulkOutSuccessNs = System.nanoTime()
+                    ncmWriteCompletedChunks++
+                    ncmWriteSuccessBytes += written
+                    return@writeUsbChunks written
+                }
                 failedAfterNanos = System.nanoTime() - started
                 // The framework collapses every failure into -1, which hides the one fact that
                 // decides the fix: a phone that NAKs (ETIMEDOUT) needs the link brought up, a
@@ -117,7 +141,12 @@ class NcmUsbBridge internal constructor(
                 // to recover the errno (and keep the data if it lands).
                 if (failedAfterNanos < timeout.toLong() * SLOW_FAILURE_NANOS_PER_MILLIS) {
                     val probed = sharedConnection.bulkTransferErrno(outEndpoint, block, offset, count, timeout)
-                    if (probed > 0) return@writeUsbChunks probed
+                    if (probed > 0) {
+                        lastBulkOutSuccessNs = System.nanoTime()
+                        ncmWriteCompletedChunks++
+                        ncmWriteSuccessBytes += probed
+                        return@writeUsbChunks probed
+                    }
                     errno = if (probed < 0) -probed else 0
                 }
                 written
@@ -145,7 +174,9 @@ class NcmUsbBridge internal constructor(
             val failureLine = "ncm bulk-out failed $consecutiveWriteFailures/$MAX_CONSECUTIVE_WRITE_FAILURES " +
                 "while the data path was live: endpoint=0x${outEndpoint.address.toString(16)} " +
                 "requested=${block.size} transferred=$transferred errno=${errnoLabel(errno)} " +
-                "elapsedMs=${failedAfterNanos / NANOS_PER_MILLISECOND} timeoutMs=$timeoutMillis"
+                "elapsedMs=${failedAfterNanos / NANOS_PER_MILLISECOND} timeoutMs=$timeoutMillis " +
+                "ncmCounts=enqueued=$ncmWriteEnqueuedFrames submitted=$ncmWriteSubmittedChunks " +
+                "completed=$ncmWriteCompletedChunks successBytes=$ncmWriteSuccessBytes"
             Log.i(IphoneCarPlayConfiguration.TAG, failureLine)
             // Reports only carry the diagnostic channel; the probe lines below
             // were logcat-only, so a report could never show the halt state
@@ -164,6 +195,10 @@ class NcmUsbBridge internal constructor(
                 interfaceResetAttempted = true
                 resetDataInterface()
             }
+            if (consecutiveWriteFailures == INTERFACE_RECLAIM_AT_FAILURE && !interfaceReclaimAttempted) {
+                interfaceReclaimAttempted = true
+                reclaimDataInterface()
+            }
             if (consecutiveWriteFailures >= MAX_CONSECUTIVE_WRITE_FAILURES) {
                 // USBMUX tears its whole session down for the same class of failure.
                 throw failSession(
@@ -179,10 +214,78 @@ class NcmUsbBridge internal constructor(
         }
         consecutiveWriteFailures = 0
         interfaceResetAttempted = false
+        interfaceReclaimAttempted = false
         if (loggedWriteTimeout) {
             loggedWriteTimeout = false
             Log.i(IphoneCarPlayConfiguration.TAG, "ncm bulk-out became ready")
         }
+    }
+
+    /**
+     * Issue #305: the failure ladder in [send] only advances when a
+     * transfer returns, but a wedged data path can stop producing frames
+     * altogether — the reporter's run counted 8 failures, after which no
+     * send was attempted for 45 s while inbound stayed live, so the
+     * reset / re-claim / fail rungs were structurally unreachable and the
+     * session hung silently with a frozen counter. Watch from a side
+     * thread: with the data path live, failures pending and nothing in
+     * flight, if the completed count does not move for a full stall
+     * window, production stopping is itself the next failure observation,
+     * so count one more failure through the same rungs.
+     */
+    private fun ensureStallWatchdog() {
+        if (!stallWatchdogStarted.compareAndSet(false, true)) return
+        Thread({
+            while (!closed) {
+                try {
+                    Thread.sleep(WATCHDOG_POLL_MILLIS)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                if (closed) break
+                var failTheSession = false
+                synchronized(writeLock) {
+                    if (closed || !inboundFrameSeen || writeInFlightSinceNs != 0L ||
+                        consecutiveWriteFailures == 0
+                    ) {
+                        stallCompletedSnapshot = -1
+                        return@synchronized
+                    }
+                    val now = System.nanoTime()
+                    if (stallCompletedSnapshot != ncmWriteCompletedChunks) {
+                        stallCompletedSnapshot = ncmWriteCompletedChunks
+                        stallSnapshotNs = now
+                        return@synchronized
+                    }
+                    if (now - stallSnapshotNs < STALL_NANOS) return@synchronized
+                    stallSnapshotNs = now
+                    consecutiveWriteFailures += 1
+                    val stallLine = "ncm bulk-out stalled: no completed transfer for " +
+                        "${STALL_NANOS / 1_000_000_000} s with the data path live; counting failure " +
+                        "$consecutiveWriteFailures/$MAX_CONSECUTIVE_WRITE_FAILURES " +
+                        "ncmCounts=enqueued=$ncmWriteEnqueuedFrames submitted=$ncmWriteSubmittedChunks " +
+                        "completed=$ncmWriteCompletedChunks successBytes=$ncmWriteSuccessBytes"
+                    Log.i(IphoneCarPlayConfiguration.TAG, stallLine)
+                    onDiagnostic(stallLine)
+                    if (consecutiveWriteFailures == INTERFACE_RESET_AT_FAILURE && !interfaceResetAttempted) {
+                        interfaceResetAttempted = true
+                        resetDataInterface()
+                    }
+                    if (consecutiveWriteFailures == INTERFACE_RECLAIM_AT_FAILURE && !interfaceReclaimAttempted) {
+                        interfaceReclaimAttempted = true
+                        reclaimDataInterface()
+                    }
+                    if (consecutiveWriteFailures >= MAX_CONSECUTIVE_WRITE_FAILURES) failTheSession = true
+                }
+                if (failTheSession) {
+                    onDiagnostic("ncm bulk-out stalled through the whole failure ladder; failing the session")
+                    failSession("NCM write stalled through the failure ladder while the data path was live")
+                    markAborted()
+                    runCatching { sharedConnection.frameworkConnection?.close() }
+                    break
+                }
+            }
+        }, "ncm-stall-watchdog").apply { isDaemon = true; start() }
     }
 
     /**
@@ -500,6 +603,7 @@ class NcmUsbBridge internal constructor(
             readQueued = false
             val transferred = directReadBuffer.position()
             if (transferred <= 0) return null
+            lastBulkInSuccessNs = System.nanoTime()
             directReadBuffer.flip()
             directReadBuffer.get(readBuffer, 0, transferred)
             return transferred
@@ -516,6 +620,7 @@ class NcmUsbBridge internal constructor(
         return try {
             sharedConnection.bulkTransfer(inEndpoint, readBuffer, readBuffer.size, timeout)
                 .takeIf { it > 0 }
+                ?.also { lastBulkInSuccessNs = System.nanoTime() }
         } catch (error: RuntimeException) {
             throw failSession("NCM synchronous read failed", error)
         }
@@ -584,6 +689,44 @@ class NcmUsbBridge internal constructor(
                 "targetAlt=${targetAlternate ?: "unknown"} " +
                 "ok=${result?.selected} errno=${result?.errno ?: "none"}; endpoint status: ${probeOutEndpointStatus()}",
         )
+        clearOutEndpointHalt()
+    }
+
+    /**
+     * Issue #75: the heavier recovery rung, held back until a report carried
+     * the counter evidence — a full session whose submitted chunks never
+     * complete (completed stays 0 while the session otherwise reaches
+     * SUCCESS and inbound keeps flowing). Re-selecting the interface
+     * (resetDataInterface) cannot fix that class: usbfs may short-circuit
+     * SET_INTERFACE to the setting already in effect, and it never resets
+     * the host-side endpoint state. Releasing the data interface and
+     * claiming it again (forced), then re-selecting its alternate setting,
+     * rebuilds both sides' data pipes in place. Deliberately NOT a bus
+     * reset (issue #243: resets can wedge these kernels) and not a session
+     * teardown — the 25-failure failSession rung remains the last resort.
+     * Once per failure run; every step is best-effort and logged with the
+     * counters so a retest shows whether completions resume afterwards.
+     */
+    private fun reclaimDataInterface() {
+        val usbInterface = dataInterface
+        if (usbInterface == null) {
+            Log.i(IphoneCarPlayConfiguration.TAG, "ncm bulk-out recovery: no data interface recorded; skipping re-claim")
+            return
+        }
+        val released = runCatching { sharedConnection.releaseInterface(usbInterface) }.getOrDefault(false)
+        val claimed = runCatching { sharedConnection.claimInterface(usbInterface, true) }.getOrDefault(false)
+        val reselected = if (claimed) {
+            runCatching { LegacyUsbHostCompat.select(sharedConnection, usbInterface) }.getOrNull()
+        } else {
+            null
+        }
+        val line = "ncm bulk-out recovery: re-claimed data interface ${usbInterface.id} " +
+            "released=$released claimed=$claimed reselected=${reselected?.selected} " +
+            "errno=${reselected?.errno ?: "none"}; endpoint status: ${probeOutEndpointStatus()}; " +
+            "ncmCounts=enqueued=$ncmWriteEnqueuedFrames submitted=$ncmWriteSubmittedChunks " +
+            "completed=$ncmWriteCompletedChunks successBytes=$ncmWriteSuccessBytes"
+        Log.i(IphoneCarPlayConfiguration.TAG, line)
+        onDiagnostic(line)
         clearOutEndpointHalt()
     }
 
@@ -716,9 +859,13 @@ class NcmUsbBridge internal constructor(
         private const val MAX_CONSECUTIVE_WRITE_FAILURES = 25
         /** Issue #137: one send may legitimately run to its 2 s deadline; 10 s in flight means wedged. */
         private const val WRITE_WEDGE_NANOS = 10_000_000_000L
+        /** Issue #305: completed-count frozen this long with failures pending counts as another failure. */
+        private const val STALL_NANOS = 10_000_000_000L
         private const val WATCHDOG_POLL_MILLIS = 500L
         /** Issue #279: consecutive failures at which the one-shot interface reset runs. */
         private const val INTERFACE_RESET_AT_FAILURE = 5
+        /** Issue #75: consecutive failures at which the one-shot interface re-claim runs. */
+        private const val INTERFACE_RECLAIM_AT_FAILURE = 12
         private const val ENDPOINT_STATUS_TIMEOUT_MILLIS = 500
         private const val NANOS_PER_MILLISECOND = 1_000_000L
         /** A failure that used less than 90% of its timeout never waited on the phone. */

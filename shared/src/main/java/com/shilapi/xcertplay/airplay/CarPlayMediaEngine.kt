@@ -99,11 +99,19 @@ class CarPlayMediaEngine(
      * See issue #106.
      */
     private val pendingScreenReaps = ConcurrentHashMap<AirPlaySession, ScheduledFuture<*>>()
+    private val screenReapLock = Any()
+    private val screenReapTokens = mutableMapOf<AirPlaySession, Any>()
+    /** Issues #327/#350: sessions that already used their video-only recovery attempt. */
+    private val videoRecoveryAttempted = Collections.synchronizedSet(mutableSetOf<AirPlaySession>())
     private val screenReapScheduler = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "xcertplay-screen-reap").apply { isDaemon = true }
     }
     /** Test seam: production uses [SCREEN_REAP_GRACE_MILLIS]. */
     internal var screenReapGraceMillis: Long = SCREEN_REAP_GRACE_MILLIS
+    /** Issues #327/#350: video-only recovery action (controller changeModes); set by the host.
+     * Public (not internal): the host lives in the common module, and Kotlin internal
+     * is module-scoped, so an internal member here is invisible there. */
+    var videoRecoveryAction: (() -> Unit)? = null
 
     private class BufferedStream(val stream: BufferedAudioStream, val connectionId: Any?)
 
@@ -183,14 +191,48 @@ class CarPlayMediaEngine(
         return port
     }
 
-    private fun scheduleScreenReap(session: AirPlaySession) {
-        cancelScreenReap(session)
+    private fun scheduleScreenReap(session: AirPlaySession) = synchronized(screenReapLock) {
+        val token = Any()
+        screenReapTokens[session] = token
+        scheduleScreenReap(session, token)
+    }
+
+    private fun scheduleScreenReap(session: AirPlaySession, token: Any): Unit = synchronized(screenReapLock) {
+        if (screenReapTokens[session] !== token || session.isClosed) return@synchronized
+        // Future-only cancel: the re-schedule below must not clear the
+        // videoRecoveryAttempted flag it just set.
+        pendingScreenReaps.remove(session)?.cancel(false)
         val graceMillis = screenReapGraceMillis
         pendingScreenReaps[session] = screenReapScheduler.schedule({
-            pendingScreenReaps.remove(session)
-            if (!session.isClosed) {
+            val attemptRecovery = synchronized(screenReapLock) {
+                if (screenReapTokens[session] !== token || session.isClosed) return@schedule
+                pendingScreenReaps.remove(session)
+                videoRecoveryAttempted.add(session)
+            }
+            if (attemptRecovery) {
+                // Issues #327/#350: first expiry tries video-only recovery
+                // (re-ask for the screen via changeModes; the sink already
+                // requests keyframes throughout) and grants a second grace
+                // instead of nuking the healthy control session at once.
                 session.logDebug(
                     "screen stream did not recover within ${graceMillis}ms; " +
+                        "attempting video-only recovery before closing the control session",
+                )
+                runCatching { videoRecoveryAction?.invoke() }
+                // SETUP or session teardown can cancel while the action runs. Never
+                // resurrect its timeout after that newer state has won.
+                scheduleScreenReap(session, token)
+            } else {
+                val stillMissing = synchronized(screenReapLock) {
+                    if (screenReapTokens[session] !== token) false else {
+                        screenReapTokens.remove(session)
+                        videoRecoveryAttempted.remove(session)
+                        true
+                    }
+                }
+                if (!stillMissing) return@schedule
+                session.logDebug(
+                    "screen stream did not recover within ${graceMillis}ms after video-only recovery; " +
                         "closing the control session",
                 )
                 session.close()
@@ -198,8 +240,10 @@ class CarPlayMediaEngine(
         }, graceMillis, TimeUnit.MILLISECONDS)
     }
 
-    private fun cancelScreenReap(session: AirPlaySession) {
+    private fun cancelScreenReap(session: AirPlaySession) = synchronized(screenReapLock) {
+        screenReapTokens.remove(session)
         pendingScreenReaps.remove(session)?.cancel(false)
+        videoRecoveryAttempted.remove(session)
     }
 
     override fun onAudio(session: AirPlaySession, type: Int, stream: Map<String, Any?>): Map<String, Any?>? {

@@ -10,54 +10,79 @@ class HybridBluetoothAdapter(
     val android: AndroidBluetoothAdapter,
     /** USB dongle stack; preferred for data channels when plugged in. */
     val usbDongle: UsbBtBluetoothAdapter? = null,
+    var sourceProvider: () -> BluetoothSource = { BluetoothSource.AUTO },
 ) : CarPlayBluetooth {
 
     companion object {
         private const val TAG = "HybridBluetoothAdapter"
     }
 
-    override fun isSupported(): Boolean =
-        hsae.isSupported() || android.isSupported() || usbDongle?.isSupported() == true
+    private val currentSource get() = sourceProvider()
 
-    override fun isEnabled(): Boolean {
-        if (usbDongle?.isSupported() == true) return usbDongle.isEnabled()
-        if (hsae.isSupported() && hsae.isEnabled()) return true
-        return android.isEnabled()
+    override fun isSupported(): Boolean = when (currentSource) {
+        BluetoothSource.BUILTIN -> hsae.isSupported() || android.isSupported()
+        BluetoothSource.USB_DONGLE -> usbDongle?.isSupported() == true
+        BluetoothSource.AUTO -> hsae.isSupported() || android.isSupported() || usbDongle?.isSupported() == true
+    }
+
+    override fun isEnabled(): Boolean = when (currentSource) {
+        BluetoothSource.BUILTIN -> {
+            if (hsae.isSupported() && hsae.isEnabled()) true
+            else android.isEnabled()
+        }
+        BluetoothSource.USB_DONGLE -> usbDongle?.isSupported() == true && usbDongle.isEnabled()
+        BluetoothSource.AUTO -> {
+            if (usbDongle?.isSupported() == true) usbDongle.isEnabled()
+            else if (hsae.isSupported() && hsae.isEnabled()) true
+            else android.isEnabled()
+        }
     }
 
     override fun enable(): Boolean {
-        var ok = false
-        if (hsae.isSupported()) {
-            ok = hsae.enable()
+        when (currentSource) {
+            BluetoothSource.BUILTIN -> {
+                var ok = false
+                if (hsae.isSupported()) ok = hsae.enable()
+                if (android.enable()) ok = true
+                return ok
+            }
+            BluetoothSource.USB_DONGLE -> {
+                return usbDongle?.isSupported() == true && usbDongle.enable()
+            }
+            BluetoothSource.AUTO -> {
+                var ok = false
+                if (hsae.isSupported()) ok = hsae.enable()
+                if (android.enable()) ok = true
+                if (usbDongle?.isSupported() == true) {
+                    return usbDongle.enable()
+                }
+                return ok
+            }
         }
-        if (android.enable()) ok = true
-        // USB dongle: enable whenever one is plugged in. Previously this only
-        // ran when neither HSAE nor Android existed, so on T3 (HSAE present
-        // but audio-only) the dongle was never enabled and wireless could
-        // never reach it (P0-1). Plugging in a dongle is itself the opt-in.
-        if (usbDongle?.isSupported() == true) {
-            return usbDongle.enable()
-        }
-        return ok
     }
 
     override fun disable() {
-        usbDongle?.disable()
+        if (currentSource != BluetoothSource.BUILTIN) {
+            usbDongle?.disable()
+        }
     }
 
     override fun getAdapterName(): String {
         val parts = mutableListOf<String>()
-        if (hsae.isSupported()) parts.add("HSAE")
-        if (android.isSupported()) parts.add("Android")
-        if (usbDongle?.isSupported() == true) parts.add("USB")
+        if (currentSource != BluetoothSource.USB_DONGLE) {
+            if (hsae.hasHsaeService()) parts.add("HSAE")
+            if (hsae.hasAnwPhoneLink()) parts.add("AnwPhoneLink")
+            if (android.isSupported()) parts.add("Android")
+        }
+        if (currentSource != BluetoothSource.BUILTIN && usbDongle?.isSupported() == true) {
+            parts.add("USB")
+        }
         return if (parts.isEmpty()) android.getAdapterName()
+        else if (parts.size == 1 && parts[0] == "USB") "USB"
         else "Hybrid(${parts.joinToString("+")})"
     }
 
     override fun getPairedDevices(): List<CarPlayBluetoothDevice> {
-        // Merge all stacks, dedupe by MAC. Previously this returned the first
-        // non-empty list, so an iPhone paired on the dongle was invisible
-        // when HSAE had any (audio-only) paired device (P1-1).
         val seen = HashSet<String>()
         val merged = ArrayList<CarPlayBluetoothDevice>()
         fun addAll(devices: List<CarPlayBluetoothDevice>) {
@@ -66,44 +91,52 @@ class HybridBluetoothAdapter(
                 if (seen.add(key)) merged.add(device)
             }
         }
-        if (hsae.isSupported()) runCatching { addAll(hsae.getPairedDevices()) }
-        runCatching { addAll(android.getPairedDevices()) }
-        usbDongle?.let { runCatching { addAll(it.getPairedDevices()) } }
+        if (currentSource != BluetoothSource.USB_DONGLE) {
+            if (hsae.isSupported()) runCatching { addAll(hsae.getPairedDevices()) }
+            runCatching { addAll(android.getPairedDevices()) }
+        }
+        if (currentSource != BluetoothSource.BUILTIN) {
+            usbDongle?.let { runCatching { addAll(it.getPairedDevices()) } }
+        }
         return merged
     }
 
     override fun getConnectedDevice(): CarPlayBluetoothDevice? {
-        // Dongle first: it is the data-capable stack. HSAE may report a
-        // connected audio-only device that cannot carry iAP2.
-        usbDongle?.let { runCatching { it.getConnectedDevice() } }?.getOrNull()?.let { return it }
-        android.getConnectedDevice()?.let { return it }
-        if (hsae.isSupported()) {
-            runCatching { hsae.getConnectedDevice() }.getOrNull()?.let { return it }
+        if (currentSource != BluetoothSource.BUILTIN) {
+            usbDongle?.let { runCatching { it.getConnectedDevice() } }?.getOrNull()?.let { return it }
+        }
+        if (currentSource != BluetoothSource.USB_DONGLE) {
+            android.getConnectedDevice()?.let { return it }
+            if (hsae.isSupported()) {
+                runCatching { hsae.getConnectedDevice() }.getOrNull()?.let { return it }
+            }
         }
         return null
     }
 
     override fun localAddress(context: Context): String? {
-        // Dongle first: its BD_ADDR is the one the iPhone must pair with for
-        // the data channel. Falling back to HSAE's address would pair the
-        // iPhone to the audio-only module.
-        usbDongle?.let { runCatching { it.localAddress(context) } }?.getOrNull()
-            ?.takeIf { !it.isNullOrBlank() }?.let { return it }
-        if (hsae.isSupported()) {
-            val hsaeAddr = hsae.localAddress(context)
-            if (!hsaeAddr.isNullOrBlank()) return hsaeAddr
+        if (currentSource != BluetoothSource.BUILTIN) {
+            usbDongle?.let { runCatching { it.localAddress(context) } }?.getOrNull()
+                ?.takeIf { !it.isNullOrBlank() }?.let { return it }
         }
-        android.localAddress(context)?.let { return it }
+        if (currentSource != BluetoothSource.USB_DONGLE) {
+            if (hsae.isSupported()) {
+                val hsaeAddr = hsae.localAddress(context)
+                if (!hsaeAddr.isNullOrBlank()) return hsaeAddr
+            }
+            android.localAddress(context)?.let { return it }
+        }
         return null
     }
 
     override fun openRfcommStream(deviceAddress: String, uuid: String): BlockingDuplexByteStream {
         val dongle = usbDongle
-        if (dongle?.isSupported() == true) {
+        if (currentSource != BluetoothSource.BUILTIN && dongle?.isSupported() == true) {
             if (!dongle.isEnabled()) throw java.io.IOException("USB Bluetooth not enabled")
-            // An iAP2 advertisement and bond belong to one local adapter address.
-            // Switching to GOC/HSAE cannot resume the dongle's connection.
             return dongle.openRfcommStream(deviceAddress, uuid)
+        }
+        if (currentSource == BluetoothSource.USB_DONGLE) {
+            throw java.io.IOException("USB Bluetooth dongle required but not available or supported")
         }
         var failure: Exception? = null
         if (android.isSupported() && android.isEnabled()) {

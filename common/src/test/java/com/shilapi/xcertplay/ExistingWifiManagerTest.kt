@@ -91,6 +91,101 @@ class ExistingWifiManagerTest {
         manager().use { assertEquals("192.0.2.10", start(it).hostAddress!!.hostAddress) }
     }
 
+    @Test fun usbSharedNetworkAttachesWithoutWifiInfo() {
+        doReturn(capabilities(NetworkCapabilities.TRANSPORT_ETHERNET)).`when`(connectivity).getNetworkCapabilities(network)
+        `when`(wifi.connectionInfo).thenThrow(SecurityException("Wi-Fi is off"))
+        manager().use {
+            val result = start(it)
+            assertEquals(WirelessHotspotBackend.EXISTING_WIFI, result.backend)
+            assertEquals("192.0.2.10", result.hostAddress!!.hostAddress)
+            assertEquals(iface.name, result.interfaceName)
+            assertEquals(0, result.channel)
+            assertNull(result.frequencyMHz)
+            assertEquals("Auto", result.bandLabel)
+            assertEquals("Pocket Wi-Fi", result.ssid)
+            assertEquals("pocket-password", result.passphrase)
+            assertNull(result.accessPointBssid)
+            val line = DiagnosticRedactor.redact(diagnostics.single { line -> line.contains("Existing Wi-Fi attached") })!!
+            assertTrue(line.contains("via=usb-network"))
+            assertTrue(line.contains("channel=auto"))
+        }
+        verify(wifi, never()).connectionInfo
+    }
+
+    @Test fun wifiNetworkWinsOverUsbSharedNetwork() {
+        val usb = mock(Network::class.java)
+        `when`(connectivity.allNetworks).thenReturn(arrayOf(network, usb))
+        doReturn(capabilities(NetworkCapabilities.TRANSPORT_ETHERNET)).`when`(connectivity).getNetworkCapabilities(usb)
+        val usbLink = link("192.0.2.20/24")
+        `when`(connectivity.getLinkProperties(usb)).thenReturn(usbLink)
+        manager().use {
+            val result = start(it)
+            assertEquals("192.0.2.10", result.hostAddress!!.hostAddress)
+            assertEquals(36, result.channel)
+            assertTrue(diagnostics.none { line -> line.contains("via=usb-network") })
+        }
+    }
+
+    @Test fun refusesAmbiguousUsbSharedNetworks() {
+        val other = mock(Network::class.java)
+        `when`(connectivity.allNetworks).thenReturn(arrayOf(network, other))
+        doReturn(capabilities(NetworkCapabilities.TRANSPORT_ETHERNET)).`when`(connectivity).getNetworkCapabilities(network)
+        doReturn(capabilities(NetworkCapabilities.TRANSPORT_ETHERNET)).`when`(connectivity).getNetworkCapabilities(other)
+        manager().use { assertTrue(assertThrows(IOException::class.java) { start(it) }.message!!.contains("Multiple")) }
+    }
+
+    @Test fun usbSharedNetworkLossRestartsSession() {
+        doReturn(capabilities(NetworkCapabilities.TRANSPORT_ETHERNET)).`when`(connectivity).getNetworkCapabilities(network)
+        manager().use {
+            start(it)
+            `when`(connectivity.allNetworks).thenReturn(emptyArray())
+            callback.onLost(network)
+            awaitChanges(1)
+        }
+    }
+
+    @Test fun transientUsbNetworkLossWithSameLinkReturningKeepsSession() {
+        doReturn(capabilities(NetworkCapabilities.TRANSPORT_ETHERNET)).`when`(connectivity).getNetworkCapabilities(network)
+        val replacement = mock(Network::class.java)
+        doReturn(capabilities(NetworkCapabilities.TRANSPORT_ETHERNET)).`when`(connectivity).getNetworkCapabilities(replacement)
+        `when`(connectivity.getLinkProperties(replacement)).thenAnswer { properties }
+        manager().use {
+            start(it)
+            `when`(connectivity.allNetworks).thenReturn(arrayOf(replacement))
+            callback.onLost(network)
+            awaitRecovery()
+            // Settle window: the grace thread clears its pending flag just after
+            // logging the recovery, and the next loss must arm a fresh grace.
+            Thread.sleep(200)
+            assertEquals(0, changes)
+            assertTrue(diagnostics.any { line -> line.contains("transient loss recovered") })
+            // The replacement is adopted: losing it restarts the session.
+            `when`(connectivity.allNetworks).thenReturn(emptyArray())
+            callback.onLost(replacement)
+            awaitChanges(1)
+        }
+    }
+
+    @Test fun usbNetworkLossWithDifferentLinkReturningRestartsSession() {
+        doReturn(capabilities(NetworkCapabilities.TRANSPORT_ETHERNET)).`when`(connectivity).getNetworkCapabilities(network)
+        val replacement = mock(Network::class.java)
+        doReturn(capabilities(NetworkCapabilities.TRANSPORT_ETHERNET)).`when`(connectivity).getNetworkCapabilities(replacement)
+        val otherLink = link("192.0.2.99/24")
+        `when`(connectivity.getLinkProperties(replacement)).thenReturn(otherLink)
+        manager().use {
+            start(it)
+            `when`(connectivity.allNetworks).thenReturn(arrayOf(replacement))
+            callback.onLost(network)
+            awaitChanges(1)
+        }
+    }
+
+    @Test fun usbSharedNetworkWithoutUsableAddressTimesOut() {
+        doReturn(capabilities(NetworkCapabilities.TRANSPORT_ETHERNET)).`when`(connectivity).getNetworkCapabilities(network)
+        properties.setLinkAddresses(emptyList())
+        manager().use { assertTrue(assertThrows(IOException::class.java) { start(it, 1) }.message!!.contains("not connected")) }
+    }
+
     @Test fun publishesIpv4AndKeepsTheScopedLinkLocalAsSecondary() {
         properties.setLinkAddresses(properties.linkAddresses + linkAddress("fe80::1234/64"))
         manager().use {
@@ -222,7 +317,21 @@ class ExistingWifiManagerTest {
     }
 
     private fun manager(password: String = "pocket-password") = ExistingWifiManager(context,
-        "Pocket Wi-Fi", password, diagnostics::add, { changes++ })
+        "Pocket Wi-Fi", password, diagnostics::add, { changes++ },
+        lostGraceMillis = 60, lostPollMillis = 10)
+
+    private fun awaitChanges(expected: Int, timeoutMillis: Long = 2000) {
+        val deadline = System.currentTimeMillis() + timeoutMillis
+        while (changes != expected && System.currentTimeMillis() < deadline) Thread.sleep(10)
+        assertEquals(expected, changes)
+    }
+
+    private fun awaitRecovery(timeoutMillis: Long = 2000) {
+        val deadline = System.currentTimeMillis() + timeoutMillis
+        while (diagnostics.none { it.contains("transient loss recovered") } &&
+            System.currentTimeMillis() < deadline) Thread.sleep(10)
+        assertTrue(diagnostics.any { it.contains("transient loss recovered") })
+    }
 
     private fun link(address: String) = LinkProperties().apply {
         interfaceName = iface.name

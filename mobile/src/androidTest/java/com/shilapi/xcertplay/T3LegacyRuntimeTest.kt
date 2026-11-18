@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.hardware.usb.UsbInterface
+import android.opengl.EGL14
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
@@ -184,8 +185,44 @@ class T3LegacyRuntimeTest {
     }
 
     @Test fun h264FirstFrameRendersAndDecoderReleasesOnKitKat() {
-        val texture = android.graphics.SurfaceTexture(1)
+        // Drain the real consumer between sessions. Without a current GL context and
+        // updateTexImage(), a second frame notification can remain coalesced on KitKat.
+        val display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+        assertTrue(EGL14.eglInitialize(display, IntArray(2), 0, IntArray(2), 0))
+        val configs = arrayOfNulls<android.opengl.EGLConfig>(1)
+        assertTrue(EGL14.eglChooseConfig(display, intArrayOf(
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT,
+            EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_NONE,
+        ), 0, configs, 0, 1, IntArray(1), 0))
+        val glContext = EGL14.eglCreateContext(display, configs[0], EGL14.EGL_NO_CONTEXT,
+            intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0)
+        val pbuffer = EGL14.eglCreatePbufferSurface(display, configs[0],
+            intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
+        assertTrue(EGL14.eglMakeCurrent(display, pbuffer, pbuffer, glContext))
+        val textureNames = IntArray(1)
+        android.opengl.GLES20.glGenTextures(1, textureNames, 0)
+        val texture = android.graphics.SurfaceTexture(textureNames[0])
         val surface = android.view.Surface(texture)
+        try {
+            // A decoder release must leave the same producer available for the next session.
+            // lockCanvas() would attach a CPU producer permanently and break the second round.
+            repeat(2) {
+                renderH264ToSurface(texture, surface)
+                texture.updateTexImage()
+            }
+        } finally {
+            surface.release()
+            texture.release()
+            android.opengl.GLES20.glDeleteTextures(1, textureNames, 0)
+            EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+            EGL14.eglDestroySurface(display, pbuffer)
+            EGL14.eglDestroyContext(display, glContext)
+            EGL14.eglTerminate(display)
+        }
+    }
+
+    private fun renderH264ToSurface(texture: android.graphics.SurfaceTexture, surface: android.view.Surface) {
         val rendered = CountDownLatch(1)
         val frameAvailable = CountDownLatch(1)
         texture.setOnFrameAvailableListener { frameAvailable.countDown() }
@@ -217,12 +254,14 @@ class T3LegacyRuntimeTest {
                     if (input >= 0) {
                         val pixels = ByteArray(320 * 240 * 3 / 2) { 128.toByte() }
                         encoder.inputBuffers[input].apply { clear(); put(pixels) }
-                        encoder.queueInputBuffer(input, 0, pixels.size, submitted * 33333L, 0)
+                        encoder.queueInputBuffer(input, 0, pixels.size, submitted * 33333L,
+                            if (submitted == 9) android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0)
                         submitted++
                     }
                 }
                 val output = encoder.dequeueOutputBuffer(info, 10000)
                 if (output == android.media.MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    lines += "encoder output format changed: ${encoder.outputFormat}"
                     fun parameter(name: String): ByteArray {
                         val buffer = encoder.outputFormat.getByteBuffer(name)!!.duplicate()
                         val bytes = ByteArray(buffer.remaining()).also(buffer::get)
@@ -231,17 +270,28 @@ class T3LegacyRuntimeTest {
                     }
                     val sps = parameter("csd-0")
                     val pps = parameter("csd-1")
-                    val avc = byteArrayOf(1, sps[1], sps[2], sps[3], 0xff.toByte(), 0xe1.toByte(),
-                        (sps.size ushr 8).toByte(), sps.size.toByte()) + sps +
-                        byteArrayOf(1, (pps.size ushr 8).toByte(), pps.size.toByte()) + pps
-                    sink.onVideoCodec(0, VideoCodec.H264)
-                    sink.onVideoConfig(0, avc)
+                    configureH264Sink(sink, sps, pps)
                 } else if (output >= 0) {
-                    if (info.flags and android.media.MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0 && info.size > 0) {
+                    lines += "encoder output flags=${info.flags} bytes=${info.size}"
+                    if (info.size > 0) {
                         val buffer = encoder.outputBuffers[output].duplicate().apply {
                             position(info.offset); limit(info.offset + info.size)
                         }
-                        sink.onVideoFrame(0, carPlayAccessUnit(ByteArray(info.size).also(buffer::get)))
+                        val packet = carPlayAccessUnit(ByteArray(info.size).also(buffer::get))
+                        if (info.flags and android.media.MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                            // Jelly Bean reports SPS/PPS in a config buffer without an
+                            // INFO_OUTPUT_FORMAT_CHANGED event; feed the same AVC config.
+                            val input = java.io.DataInputStream(java.io.ByteArrayInputStream(packet))
+                            val units = mutableListOf<ByteArray>()
+                            while (input.available() > 0) {
+                                val size = input.readInt()
+                                check(size > 0 && size <= input.available())
+                                units += ByteArray(size).also(input::readFully)
+                            }
+                            configureH264Sink(sink,
+                                units.first { it[0].toInt() and 31 == 7 },
+                                units.first { it[0].toInt() and 31 == 8 })
+                        } else sink.onVideoFrame(0, packet)
                     }
                     encoder.releaseOutputBuffer(output, false)
                 }
@@ -253,10 +303,16 @@ class T3LegacyRuntimeTest {
             encoder.release()
             sink.close()
             val released = sink.awaitVideoReleased(3000)
-            surface.release()
-            texture.release()
             assertTrue("Video decoder did not release", released)
         }
+    }
+
+    private fun configureH264Sink(sink: AndroidMediaSink, sps: ByteArray, pps: ByteArray) {
+        val avc = byteArrayOf(1, sps[1], sps[2], sps[3], 0xff.toByte(), 0xe1.toByte(),
+            (sps.size ushr 8).toByte(), sps.size.toByte()) + sps +
+            byteArrayOf(1, (pps.size ushr 8).toByte(), pps.size.toByte()) + pps
+        sink.onVideoCodec(0, VideoCodec.H264)
+        sink.onVideoConfig(0, avc)
     }
 
     @Test fun airPlayListenerAnswersInfoAndRecoversOccupiedPortTwice() {

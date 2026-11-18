@@ -1,6 +1,9 @@
 package com.shilapi.xcertplay.bluetooth
 
 import android.content.Context
+import android.content.Intent
+import android.content.pm.ResolveInfo
+import android.content.pm.ServiceInfo
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -8,6 +11,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
@@ -76,5 +80,45 @@ class BluetoothAdapterTest {
         // On non-Nissan system or test JVM, HSAE package com.hsae.bluetoothservice does not exist
         assertFalse(hsae.isSupported())
         assertEquals("Hybrid(Android)", hybrid.getAdapterName())
+    }
+
+    @Test
+    fun testAnwPhoneLinkServiceMakesHsaeStackSupportedAndEnabled() {
+        val intent = Intent("com.anwsdk.service.AnwPhoneLink").apply {
+            setPackage("com.anwsdk.service")
+        }
+        val resolveInfo = ResolveInfo().apply {
+            serviceInfo = ServiceInfo().apply {
+                name = "com.anwsdk.service.AnwPhoneLinkService"
+                packageName = "com.anwsdk.service"
+            }
+        }
+        shadowOf(context.packageManager).addResolveInfoForIntent(intent, resolveInfo)
+
+        val hsae = HsaeBluetoothAdapter(context)
+        assertFalse(hsae.hasHsaeService())
+        assertTrue(hsae.hasAnwPhoneLink())
+        assertTrue(hsae.isSupported())
+        // ANW-only units have no power query; a resolvable service counts as enabled
+        // without waiting on the absent HSAE manager bind.
+        assertTrue(hsae.isEnabled())
+        assertTrue(hsae.enable())
+        assertTrue(hsae.getPairedDevices().isEmpty())
+        assertEquals(null, hsae.getConnectedDevice())
+
+        val hybrid = HybridBluetoothAdapter(hsae, AndroidBluetoothAdapter(context))
+        assertTrue(hybrid.isSupported())
+        assertTrue(hybrid.isEnabled())
+        assertEquals("Hybrid(AnwPhoneLink+Android)", hybrid.getAdapterName())
+    }
+
+    @Test
+    fun testAnwPhoneLinkAbsentKeepsHsaeStackUnsupported() {
+        val hsae = HsaeBluetoothAdapter(context)
+        assertFalse(hsae.hasHsaeService())
+        assertFalse(hsae.hasAnwPhoneLink())
+        assertFalse(hsae.isSupported())
+        assertFalse(hsae.isEnabled())
+        assertFalse(hsae.enable())
     }
 }

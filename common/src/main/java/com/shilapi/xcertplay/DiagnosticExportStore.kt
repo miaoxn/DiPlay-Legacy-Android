@@ -40,7 +40,7 @@ internal object DiagnosticExportStore {
             } else {
                 saveInDirectory(context, File(context.filesDir, "diagnostic-reports"), fileName, report, savedInApp = true)
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             // A missing, read-only or full external volume must not prevent export.
             saveInDirectory(context, File(context.filesDir, "diagnostic-reports"), fileName, report, savedInApp = true)
         }
@@ -109,7 +109,15 @@ internal object DiagnosticExportStore {
             // Do not overwrite an existing report or follow an unexpected symlink.
             if (destination.exists()) return@runCatching emptyList()
             val bytes = report.toByteArray(Charsets.UTF_8)
-            destination.outputStream().use { it.write(bytes); it.flush() }
+            destination.outputStream().use { stream ->
+                stream.write(bytes)
+                stream.flush()
+                // Issue #341: length() alone cannot prove the bytes reached the stick —
+                // a caching mount can report the right size for content it later loses.
+                // Best-effort sync: mounts without fsync support throw here, and that
+                // must not fail an otherwise good copy.
+                runCatching { stream.fd.sync() }
+            }
             if (destination.length() != bytes.size.toLong()) {
                 destination.delete()
                 return@runCatching emptyList()
@@ -213,12 +221,14 @@ internal object DiagnosticExportStore {
         val file = File.createTempFile(fileName.removeSuffix(".txt") + "-", ".txt", directory)
         try {
             file.writeText(report, Charsets.UTF_8)
-            val uri = FileProvider.getUriForFile(context, "${context.packageName}.diagnostic-reports", file)
+            val uri = runCatching {
+                FileProvider.getUriForFile(context, "${context.packageName}.diagnostic-reports", file)
+            }.getOrElse { Uri.fromFile(file) }
             // Retain only the newest eight reports; never prune the export being returned.
             directory.listFiles()?.filter { it != file && it.isFile }
                 ?.sortedByDescending { it.lastModified() }?.drop(7)?.forEach { it.delete() }
             return SavedReport(uri, savedInApp = savedInApp, savedPath = if (savedInApp) null else file.absolutePath)
-        } catch (error: Exception) {
+        } catch (error: Throwable) {
             file.delete()
             throw error
         }

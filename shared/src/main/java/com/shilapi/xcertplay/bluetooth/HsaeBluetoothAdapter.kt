@@ -75,17 +75,23 @@ class HsaeBluetoothAdapter(
     }
 
     init {
-        if (isSupported()) {
+        if (hasHsaeService()) {
             bindService()
         }
     }
 
-    override fun isSupported(): Boolean {
+    /** Whether the Hangsheng Bluetooth manager service package is installed. */
+    fun hasHsaeService(): Boolean {
         return runCatching {
             val pm = context.packageManager
             pm.getPackageInfo("com.hsae.bluetoothservice", 0) != null
         }.getOrDefault(false)
     }
+
+    /** Whether the ANW phone-link service backing the built-in data channel resolves. */
+    fun hasAnwPhoneLink(): Boolean = isAnwPhoneLinkAvailable(context)
+
+    override fun isSupported(): Boolean = hasHsaeService() || hasAnwPhoneLink()
 
     private fun bindService() {
         synchronized(lock) {
@@ -126,6 +132,12 @@ class HsaeBluetoothAdapter(
     }
 
     override fun isEnabled(): Boolean {
+        if (!hasHsaeService()) {
+            // ANW-only head units: the ANW phone-link service runs with the car stack and
+            // exposes no power query, so a resolvable service counts as enabled. A dead
+            // stack surfaces at RFCOMM connect time, as it does on other vendor stacks.
+            return hasAnwPhoneLink()
+        }
         val mgr = ensureService() ?: return false
         return try {
             val status = mgr.powerStatus
@@ -138,6 +150,9 @@ class HsaeBluetoothAdapter(
     }
 
     override fun enable(): Boolean {
+        // ANW-only head units have nothing to power on through this adapter; the car
+        // stack owns the radio. Report the ANW presence instead of a failed enable.
+        if (!hasHsaeService()) return hasAnwPhoneLink()
         val mgr = ensureService() ?: return false
         return try {
             mgr.btPowerOn()
@@ -151,6 +166,9 @@ class HsaeBluetoothAdapter(
     override fun getAdapterName(): String = adapterName
 
     override fun getPairedDevices(): List<CarPlayBluetoothDevice> {
+        // The paired list comes from the HSAE manager service; ANW exposes no such query.
+        // Skip the bind wait entirely on ANW-only units instead of stalling the merge.
+        if (!hasHsaeService()) return emptyList()
         val mgr = ensureService() ?: return emptyList()
         return try {
             val paired = mgr.pairedDevices ?: emptyList()
@@ -173,6 +191,7 @@ class HsaeBluetoothAdapter(
     }
 
     override fun getConnectedDevice(): CarPlayBluetoothDevice? {
+        if (!hasHsaeService()) return null
         val mgr = ensureService() ?: return null
         return try {
             val addr = mgr.connectDeviceAddress?.takeIf { it.isNotBlank() } ?: return null

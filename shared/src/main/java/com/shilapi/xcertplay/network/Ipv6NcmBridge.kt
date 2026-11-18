@@ -1,7 +1,10 @@
 package com.shilapi.xcertplay.network
 
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.util.Log
+import com.shilapi.xcertplay.airplay.ChainKind
+import com.shilapi.xcertplay.airplay.ChainStageEvent
 import com.shilapi.xcertplay.transport.EthernetIpv6Codec
 import com.shilapi.xcertplay.transport.NcmUsbBridge
 import java.io.Closeable
@@ -28,6 +31,8 @@ class Ipv6NcmBridge(
     /** Link-local IPv6 address assigned to the Android TUN side (e.g. "fe80::2"). */
     private val hostLinkLocal: String,
     private val onDebugLog: (String) -> Unit = {},
+    /** Stage events for the connection panel; same emission points as the [15/16]/[16/16] lines. */
+    private val onStageEvent: (ChainStageEvent) -> Unit = {},
     private val onError: (Throwable) -> Unit,
     /**
      * Issue #148: answers the iPhone's wired mDNS queries for _airplay._tcp with unicast
@@ -245,6 +250,7 @@ class Ipv6NcmBridge(
                             "bytes=${mdnsAnswers.sumOf { it.size }} sent=$sent"
                         Log.i(TAG, answerMsg)
                         runCatching { onDebugLog(answerMsg) }
+                        runCatching { onStageEvent(ChainStageEvent(ChainKind.WIRED, 15, SystemClock.elapsedRealtime(), answerMsg)) }
                     }
                     maybeLogMdnsDiag()
                     continue
@@ -305,6 +311,7 @@ class Ipv6NcmBridge(
                         val tcpMsg = "WIRED-CHAIN [16/16] first TCP packet injected to TUN (iPhone -> 7000)"
                         Log.i(TAG, tcpMsg)
                         runCatching { onDebugLog(tcpMsg) }
+                        runCatching { onStageEvent(ChainStageEvent(ChainKind.WIRED, 16, SystemClock.elapsedRealtime(), tcpMsg)) }
                     }
                 }
                 output.write(frame, ipv6.payloadOffset, ipv6.payloadLength)

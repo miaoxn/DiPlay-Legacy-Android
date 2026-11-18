@@ -53,6 +53,8 @@ object AirPlayPersistence {
     private const val KEY_ADVANCED_AUDIO_CHANNEL_MAPPING = "advanced_audio_channel_mapping"
     private const val KEY_AUDIO_FOCUS_ENABLED = "audio_focus_enabled"
     private const val KEY_AUDIO_FOCUS_AUTO_YIELD = "audio_focus_auto_yield"
+    private const val KEY_MEDIA_FOCUS_EXCLUSIVE = "media_focus_exclusive"
+    private const val KEY_LEGACY_REVERSE_COLD_START = "legacy_reverse_cold_start"
     private const val KEY_MEDIA_AUDIO_CHANNEL = "media_audio_channel"
     private const val KEY_MEDIA_VOLUME_PERCENT = "media_volume_percent"
     private const val KEY_NAVIGATION_VOLUME_PERCENT = "navigation_volume_percent"
@@ -61,6 +63,10 @@ object AirPlayPersistence {
     private const val KEY_NAVIGATION_AUDIO_CHANNEL = "navigation_audio_channel"
     private const val KEY_NAVIGATION_STREAM_TYPE = "navigation_stream_type"
     private const val KEY_WIRELESS_ENABLED = "wireless_enabled"
+    /** Issue #290: consecutive wireless link-establishment failures (iPhone never opens AirPlay TCP). */
+    private const val KEY_WIRELESS_LINK_FAILURES = "wireless_link_failures"
+    /** Issue #290: whether the forget-and-repair prompt was already shown for the current streak. */
+    private const val KEY_WIRELESS_REPAIR_PROMPT_SHOWN = "wireless_repair_prompt_shown"
     private const val KEY_USB_BT_AUTO_START = "usb_bt_auto_start"
     private const val KEY_WIRELESS_HOTSPOT_MODE = "wireless_hotspot_mode"
     private const val KEY_WIFI_P2P_PREFERRED_CHANNEL = "wifi_p2p_preferred_channel"
@@ -73,11 +79,22 @@ object AirPlayPersistence {
     private const val KEY_HOSTAPD_SSID = "hostapd_ssid"
     private const val KEY_HOSTAPD_PASSPHRASE = "hostapd_passphrase"
     private const val KEY_HOSTAPD_CHANNEL = "hostapd_channel"
+    private const val KEY_HOSTAPD_APPLE_VENDOR_IE = "hostapd_apple_vendor_ie"
+    private const val KEY_CARPLAY_AUTO_DISCONNECT_BT = "carplay_auto_disconnect_bt"
+    private const val KEY_BLUETOOTH_SOURCE = "bluetooth_source"
+    private const val KEY_WIFI_FOREGROUND_TRIGGER = "wifi_foreground_trigger"
+    private const val KEY_TELEPHONY_DOWNLINK_VIA_MUSIC = "telephony_downlink_via_music"
+    private const val KEY_ANNOUNCEMENT_DUCK_MEDIA = "announcement_duck_media"
+    private const val KEY_DOCK_BAR_REFRONT = "dock_bar_refront"
     private const val KEY_DEBUG_LOGS_ENABLED = "debug_logs_enabled"
     private const val KEY_MANUFACTURER = "manufacturer"
     private const val KEY_MODEL = "model"
     private const val KEY_OEM_LABEL = "oem_label"
     private const val KEY_CARPLAY_NIGHT_MODE = "carplay_night_mode"
+    private const val KEY_APP_THEME_MODE = "app_theme_mode"
+    private const val KEY_APP_THEME_TIME_WINDOW = "app_theme_time_window"
+    private const val KEY_APP_THEME_NIGHT_START = "app_theme_night_start_minute"
+    private const val KEY_APP_THEME_NIGHT_END = "app_theme_night_end_minute"
     private const val KEY_CARPLAY_NIGHT_START = "carplay_night_start_minute"
     private const val KEY_CARPLAY_NIGHT_END = "carplay_night_end_minute"
     private const val KEY_AMBIENT_LUX_THRESHOLD = "ambient_lux_threshold"
@@ -89,6 +106,7 @@ object AirPlayPersistence {
     private const val KEY_CALL_MIC_COMPATIBILITY = "call_mic_compatibility"
     private const val KEY_SMOOTH_VIDEO = "smooth_video"
     private const val KEY_CAR_BLUETOOTH_AUDIO = "car_bluetooth_audio"
+    private const val KEY_BLUETOOTH_MUSIC_AUTO_OPEN = "bluetooth_music_auto_open"
     private const val KEY_DIRECT_SURFACE_VIEW = "direct_surface_view"
     private const val KEY_DIRECT_USBFS_MODE = "direct_usbfs_mode"
     private const val KEY_CLUSTER_MAP = "cluster_map_enabled"
@@ -262,9 +280,57 @@ object AirPlayPersistence {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getBoolean(KEY_AUDIO_FOCUS_AUTO_YIELD, true)
 
+    /** Issue #315: legacy-chip reverse cold start; default on for legacy head units, takes effect on the next reverse. */
+    fun loadLegacyReverseColdStart(context: Context): Boolean {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (prefs.contains(KEY_LEGACY_REVERSE_COLD_START)) {
+            return prefs.getBoolean(KEY_LEGACY_REVERSE_COLD_START, false)
+        }
+        return isLegacyReverseHeadUnit()
+    }
+
+    fun saveLegacyReverseColdStart(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_LEGACY_REVERSE_COLD_START, enabled)
+            .apply()
+    }
+
     fun saveAudioFocusAutoYield(context: Context, enabled: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean(KEY_AUDIO_FOCUS_AUTO_YIELD, enabled)
+            .apply()
+    }
+
+    /** Issue #290: media focus exclusive mode; off by default, takes effect on the next connection. */
+    fun loadMediaFocusExclusive(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_MEDIA_FOCUS_EXCLUSIVE, false)
+
+    fun saveMediaFocusExclusive(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_MEDIA_FOCUS_EXCLUSIVE, enabled)
+            .apply()
+    }
+
+    /** Issue #290: consecutive wireless link-establishment failures; 0 when no streak is active. */
+    fun loadWirelessLinkFailures(context: Context): Int =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_WIRELESS_LINK_FAILURES, 0)
+
+    fun saveWirelessLinkFailures(context: Context, failures: Int) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putInt(KEY_WIRELESS_LINK_FAILURES, failures)
+            .apply()
+    }
+
+    /** Issue #290: whether the forget-and-repair prompt was already shown for the current streak. */
+    fun loadWirelessRepairPromptShown(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_WIRELESS_REPAIR_PROMPT_SHOWN, false)
+
+    fun saveWirelessRepairPromptShown(context: Context, shown: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_WIRELESS_REPAIR_PROMPT_SHOWN, shown)
             .apply()
     }
 
@@ -344,6 +410,28 @@ object AirPlayPersistence {
     fun saveUsbBtAutoStart(context: Context, enabled: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean(KEY_USB_BT_AUTO_START, enabled)
+            .apply()
+    }
+
+    fun loadBluetoothSource(context: Context): com.shilapi.xcertplay.bluetooth.BluetoothSource {
+        val stored = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_BLUETOOTH_SOURCE, null)
+        return com.shilapi.xcertplay.bluetooth.BluetoothSource.fromKey(stored)
+    }
+
+    fun saveBluetoothSource(context: Context, source: com.shilapi.xcertplay.bluetooth.BluetoothSource) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_BLUETOOTH_SOURCE, source.key)
+            .apply()
+    }
+
+    fun loadWifiForegroundTrigger(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_WIFI_FOREGROUND_TRIGGER, true)
+
+    fun saveWifiForegroundTrigger(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_WIFI_FOREGROUND_TRIGGER, enabled)
             .apply()
     }
 
@@ -602,6 +690,24 @@ object AirPlayPersistence {
             .putString(KEY_CARPLAY_NIGHT_MODE, mode.key).apply()
     }
 
+    fun loadAppThemeMode(context: Context): AppThemeMode = AppThemeMode.fromKey(
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_APP_THEME_MODE, null),
+    )
+
+    fun saveAppThemeMode(context: Context, mode: AppThemeMode) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_APP_THEME_MODE, mode.key).apply()
+    }
+
+    fun loadAppThemeTimeWindow(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_APP_THEME_TIME_WINDOW, false)
+
+    fun saveAppThemeTimeWindow(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_APP_THEME_TIME_WINDOW, enabled).apply()
+    }
+
     fun loadCarPlayNightSchedule(context: Context): CarPlayNightSchedule {
         val preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val defaults = CarPlayNightSchedule()
@@ -611,6 +717,24 @@ object AirPlayPersistence {
             start.takeIf { it in 0 until 24 * 60 } ?: defaults.startMinute,
             end.takeIf { it in 0 until 24 * 60 } ?: defaults.endMinute,
         )
+    }
+
+    fun loadAppThemeNightWindow(context: Context): AppThemeNightWindow {
+        val preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val defaults = AppThemeNightWindow()
+        val start = preferences.getInt(KEY_APP_THEME_NIGHT_START, defaults.startMinute)
+        val end = preferences.getInt(KEY_APP_THEME_NIGHT_END, defaults.endMinute)
+        return AppThemeNightWindow(
+            start.takeIf { it in 0 until 24 * 60 } ?: defaults.startMinute,
+            end.takeIf { it in 0 until 24 * 60 } ?: defaults.endMinute,
+        )
+    }
+
+    fun saveAppThemeNightWindow(context: Context, window: AppThemeNightWindow) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putInt(KEY_APP_THEME_NIGHT_START, window.startMinute)
+            .putInt(KEY_APP_THEME_NIGHT_END, window.endMinute)
+            .apply()
     }
 
     fun saveCarPlayNightSchedule(context: Context, schedule: CarPlayNightSchedule) {
@@ -644,6 +768,13 @@ object AirPlayPersistence {
 
     fun saveCarBluetoothAudio(context: Context, enabled: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_CAR_BLUETOOTH_AUDIO, enabled).apply()
+    }
+
+    fun loadBluetoothMusicAutoOpen(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_BLUETOOTH_MUSIC_AUTO_OPEN, false)
+
+    fun saveBluetoothMusicAutoOpen(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_BLUETOOTH_MUSIC_AUTO_OPEN, enabled).apply()
     }
 
     fun loadSmoothVideo(context: Context): Boolean =
@@ -681,6 +812,46 @@ object AirPlayPersistence {
 
     fun saveRootHotspotEnabled(context: Context, enabled: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ROOT_HOTSPOT_ENABLED, enabled).apply()
+    }
+
+    /** Issue #344: Apple vendor IE on the root hostapd beacon (Advanced, experimental). */
+    fun loadHostapdAppleVendorIe(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_HOSTAPD_APPLE_VENDOR_IE, false)
+
+    fun saveHostapdAppleVendorIe(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_HOSTAPD_APPLE_VENDOR_IE, enabled).apply()
+    }
+
+    /** Issue #343: auto-disconnect phone Bluetooth after wireless CarPlay connects (Advanced, experimental). */
+    fun loadCarplayAutoDisconnectBt(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_CARPLAY_AUTO_DISCONNECT_BT, false)
+
+    fun saveCarplayAutoDisconnectBt(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_CARPLAY_AUTO_DISCONNECT_BT, enabled).apply()
+    }
+
+    /** Issue #343-Q1: route the call downlink through the music stream (Advanced, experimental). */
+    fun loadTelephonyDownlinkViaMusic(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_TELEPHONY_DOWNLINK_VIA_MUSIC, false)
+
+    fun saveTelephonyDownlinkViaMusic(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_TELEPHONY_DOWNLINK_VIA_MUSIC, enabled).apply()
+    }
+
+    /** Issue #364: duck media while announcement audio flows (Advanced, experimental). */
+    fun loadAnnouncementDuckMedia(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ANNOUNCEMENT_DUCK_MEDIA, false)
+
+    fun saveAnnouncementDuckMedia(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ANNOUNCEMENT_DUCK_MEDIA, enabled).apply()
+    }
+
+    /** Issue #363: re-front the task to dismiss a launcher dock bar (experimental display). */
+    fun loadDockBarRefront(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_DOCK_BAR_REFRONT, false)
+
+    fun saveDockBarRefront(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_DOCK_BAR_REFRONT, enabled).apply()
     }
 
     fun loadHostapdSsid(context: Context): String =
@@ -744,6 +915,21 @@ object AirPlayPersistence {
         val manufacturer = Build.MANUFACTURER.lowercase(java.util.Locale.US)
         return hardware.contains("sun8i") || hardware.contains("allwinner") ||
             board.contains("exdroid") || brand.contains("allwinner") || manufacturer.contains("allwinner")
+    }
+
+    /** Issue #315: detect legacy SoCs (MTK 8227L, PF8227, Allwinner, Rockchip, Android 4.x/5.x) prone to reverse video deadlock. */
+    fun isLegacyReverseHeadUnit(): Boolean {
+        if (realSdkInt() <= 19) return true
+        val hardware = Build.HARDWARE.lowercase(java.util.Locale.US)
+        val board = Build.BOARD.lowercase(java.util.Locale.US)
+        val display = Build.DISPLAY.lowercase(java.util.Locale.US)
+        val brand = Build.BRAND.lowercase(java.util.Locale.US)
+        val manufacturer = Build.MANUFACTURER.lowercase(java.util.Locale.US)
+        val product = Build.PRODUCT.lowercase(java.util.Locale.US)
+        val device = Build.DEVICE.lowercase(java.util.Locale.US)
+        val tokens = listOf(hardware, board, display, brand, manufacturer, product, device)
+        fun anyMatches(vararg keys: String) = tokens.any { t -> keys.any { k -> t.contains(k) } }
+        return anyMatches("8227", "mt8227", "ac8227", "pf8227", "xy.android", "yecon", "sun8i", "t3", "rk3066", "rk3188", "px3")
     }
 
     /** Compatibility microphone mode for calls on Allwinner / custom ROM head units; applies at reconnect. */
@@ -1140,7 +1326,19 @@ object AirPlayPersistence {
         File(context.filesDir, CUSTOM_ICON_FILE).takeIf { it.isFile }
 
     fun loadCustomAirPlayIconBytes(context: Context): ByteArray? = try {
-        loadCustomAirPlayIconFile(context)?.readBytes()?.takeIf { it.isNotEmpty() }
+        loadCustomAirPlayIconFile(context)?.readBytes()?.takeIf { it.isNotEmpty() }?.let { raw ->
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(raw, 0, raw.size, bounds)
+            if (bounds.outWidth > 0 && bounds.outHeight > 0 && iconExceedsLimits(raw.size, bounds.outWidth, bounds.outHeight)) {
+                val normalized = normalizeCustomAirPlayIconBytes(raw)
+                runCatching {
+                    loadCustomAirPlayIconFile(context)?.writeBytes(normalized)
+                }
+                normalized
+            } else {
+                raw
+            }
+        }
     } catch (_: Throwable) {
         null
     }
@@ -1175,11 +1373,11 @@ object AirPlayPersistence {
      * when saved — at most [ICON_MAX_EDGE] px on the long edge and at most
      * [ICON_MAX_BYTES] encoded — so what is stored is already compliant.
      */
-    const val ICON_MAX_EDGE = 512
-    const val ICON_MAX_BYTES = 256_000
+    const val ICON_MAX_EDGE = 192
+    const val ICON_MAX_BYTES = 32_000
 
     /** Progressive downscale targets for oversized icons, largest first. */
-    fun iconScaleLadder(): List<Int> = listOf(512, 384, 256, 192)
+    fun iconScaleLadder(): List<Int> = listOf(192, 160, 128, 96, 64)
 
     /** True when an encoded icon of [byteCount] bytes and [width]x[height] exceeds the limits. */
     fun iconExceedsLimits(byteCount: Int, width: Int, height: Int): Boolean =

@@ -7,6 +7,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.util.Log
 import com.shilapi.xcertplay.airplay.AirPlayListenerIdentity
 import com.shilapi.xcertplay.airplay.AirPlaySocketBinder
@@ -14,6 +15,8 @@ import com.shilapi.xcertplay.airplay.AirPlayTcpAccepted
 import com.shilapi.xcertplay.airplay.isInternalAirPlayPeer
 import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
+import com.shilapi.xcertplay.airplay.ChainKind
+import com.shilapi.xcertplay.airplay.ChainStageEvent
 import com.shilapi.xcertplay.airplay.AirPlayMediaHandler
 import com.shilapi.xcertplay.airplay.AirPlaySession
 import com.shilapi.xcertplay.airplay.AirPlaySessionListener
@@ -221,6 +224,7 @@ class CarPlayVpnService : VpnService() {
                 hostMac = hostMac,
                 hostLinkLocal = linkLocal,
                 onDebugLog = { line -> runCatching { listener.onDebugLog(line) } },
+                onStageEvent = { event -> runCatching { listener.onChainStage(event) } },
                 onError = { error -> onTransportError(generation, listener, error) },
             )
             attachStage = "NCM IPv6 bridge startup"
@@ -243,7 +247,9 @@ class CarPlayVpnService : VpnService() {
                 AirPlayAttachment(scopedAddress, config, identity, pairings, mfi, listener, media),
                 listenerReuseAddress = true,
             )
-            runCatching { listener.onDebugLog("WIRED-CHAIN [13/16] AirPlay listener bound port=${boundPort()}") }
+            val chain13 = "WIRED-CHAIN [13/16] AirPlay listener bound port=${boundPort()}"
+            runCatching { listener.onDebugLog(chain13) }
+            runCatching { listener.onChainStage(ChainStageEvent(ChainKind.WIRED, 13, SystemClock.elapsedRealtime(), chain13)) }
             runCatching { listener.onDebugLog("wired AirPlay listener bound port=${boundPort()}") }
             boundPort()?.let { port ->
                 runCatching { listener.onDebugLog("wired airplay listen kernel-check: ${verifyTcp6Listen(port)}") }
@@ -365,6 +371,7 @@ class CarPlayVpnService : VpnService() {
                 hostMac = hostMac,
                 hostLinkLocal = linkLocal,
                 onDebugLog = { line -> runCatching { listener.onDebugLog(line) } },
+                onStageEvent = { event -> runCatching { listener.onChainStage(event) } },
                 onError = { error -> onTransportError(generation, listener, error) },
             )
             attachStage = "NCM lwIP bridge startup"
@@ -388,7 +395,9 @@ class CarPlayVpnService : VpnService() {
             )
             val bound = boundPort() ?: config.port
             lwip.registerPort(bound, isTcp = true)
-            runCatching { listener.onDebugLog("WIRED-CHAIN [13/16] AirPlay listener bound on 127.0.0.1 port=$bound (lwIP userspace)") }
+            val chain13 = "WIRED-CHAIN [13/16] AirPlay listener bound on 127.0.0.1 port=$bound (lwIP userspace)"
+            runCatching { listener.onDebugLog(chain13) }
+            runCatching { listener.onChainStage(ChainStageEvent(ChainKind.WIRED, 13, SystemClock.elapsedRealtime(), chain13)) }
 
             attachStage = "wired mDNS unicast responder"
             runCatching {
@@ -658,7 +667,9 @@ class CarPlayVpnService : VpnService() {
                         mfi = current.mfi,
                         listener = object : AirPlaySessionListener by current.listener {
                             override fun onSessionActive(session: AirPlaySession) {
-                                runCatching { current.listener.onDebugLog("WIRED-CHAIN [16/16] SUCCESS: AirPlay session active") }
+                                val chain16 = "WIRED-CHAIN [16/16] SUCCESS: AirPlay session active"
+                                runCatching { current.listener.onDebugLog(chain16) }
+                                runCatching { current.listener.onChainStage(ChainStageEvent(ChainKind.WIRED, 16, SystemClock.elapsedRealtime(), chain16)) }
                                 if (current.listenerIdentity == null || !internalPeer) current.listener.onSessionActive(session)
                             }
 

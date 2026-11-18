@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chain_hint_bluetooth">Asegúrate de que el adaptador Bluetooth esté conectado y el iPhone emparejado.</string>
+    <string name="chain_hint_hotspot">Comprueba el hotspot del coche y desactiva la dirección Wi-Fi privada en el iPhone para esta red.</string>
+    <string name="chain_hint_usb_permission">Desconecta y vuelve a conectar el cable y acepta el permiso USB.</string>
+    <string name="chain_stage_entered">Etapa iniciada · %1$d s</string>
+    <string name="chain_stage_waiting">Esta etapa lleva %1$d s · si no avanza, fotografía esta pantalla</string>
+    <string name="chain_step_current">[%1$d/%2$d] %3$s · esperando %4$s</string>
+    <string name="chain_step_failed">[%1$d/%2$d] %3$s · falló · esperó %4$s</string>
+    <string name="chain_step_wired_01">USB conectado</string>
+    <string name="chain_step_wired_02">Permiso USB</string>
+    <string name="chain_step_wired_03">Sesión iAP2</string>
+    <string name="chain_step_wired_04">Config. NCM</string>
+    <string name="chain_step_wired_05">Puente NCM</string>
+    <string name="chain_step_wired_06">Host USBMUX</string>
+    <string name="chain_step_wired_07">Emparejamiento</string>
+    <string name="chain_step_wired_08">Servicio CarKit</string>
+    <string name="chain_step_wired_09">Canal iAP2</string>
+    <string name="chain_step_wired_10">VPN vinculada</string>
+    <string name="chain_step_wired_11">Transporte conectado</string>
+    <string name="chain_step_wired_12">MFi listo</string>
+    <string name="chain_step_wired_13">Escucha vinculada</string>
+    <string name="chain_step_wired_14">StartSession enviado</string>
+    <string name="chain_step_wired_15">mDNS respondido</string>
+    <string name="chain_step_wired_16">Sesión activa</string>
+    <string name="chain_step_wireless_01">Adaptador Bluetooth</string>
+    <string name="chain_step_wireless_02">Bluetooth activado</string>
+    <string name="chain_step_wireless_03">Conectando RFCOMM</string>
+    <string name="chain_step_wireless_04">Canal iAP2</string>
+    <string name="chain_step_wireless_05">Iniciando hotspot</string>
+    <string name="chain_step_wireless_06">Hotspot listo</string>
+    <string name="chain_step_wireless_07">Anunciando mDNS</string>
+    <string name="chain_step_wireless_08">Túnel abierto</string>
+    <string name="chain_step_wireless_09">Túnel listo</string>
+    <string name="chain_step_wireless_10">Traspaso hecho</string>
+    <string name="chain_step_wireless_11">Transporte conectado</string>
+    <string name="chain_step_wireless_12">Sesión activa</string>
+</resources>

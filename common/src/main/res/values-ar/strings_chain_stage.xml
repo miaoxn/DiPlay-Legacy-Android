@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chain_hint_bluetooth">تأكد من توصيل محول Bluetooth واقتران iPhone.</string>
+    <string name="chain_hint_hotspot">تحقق من نقطة اتصال السيارة وأوقف «عنوان Wi-Fi الخاص» على iPhone لهذه الشبكة.</string>
+    <string name="chain_hint_usb_permission">أعد توصيل الكابل ثم اسمح بإذن USB عند ظهور الطلب.</string>
+    <string name="chain_stage_entered">بدأت المرحلة · %1$d ث</string>
+    <string name="chain_stage_waiting">هذه المرحلة بانتظار منذ %1$d ث · إذا لم تتغير، صوّر هذه الشاشة</string>
+    <string name="chain_step_current">[%1$d/%2$d] %3$s · بانتظار %4$s</string>
+    <string name="chain_step_failed">[%1$d/%2$d] %3$s · فشل · انتظر %4$s</string>
+    <string name="chain_step_wired_01">تم توصيل USB</string>
+    <string name="chain_step_wired_02">إذن USB</string>
+    <string name="chain_step_wired_03">جلسة iAP2</string>
+    <string name="chain_step_wired_04">تهيئة NCM</string>
+    <string name="chain_step_wired_05">جسر NCM</string>
+    <string name="chain_step_wired_06">مضيف USBMUX</string>
+    <string name="chain_step_wired_07">الاقتران</string>
+    <string name="chain_step_wired_08">خدمة CarKit</string>
+    <string name="chain_step_wired_09">قناة iAP2</string>
+    <string name="chain_step_wired_10">تم ربط VPN</string>
+    <string name="chain_step_wired_11">تم توصيل النقل</string>
+    <string name="chain_step_wired_12">MFi جاهز</string>
+    <string name="chain_step_wired_13">تم ربط المستمع</string>
+    <string name="chain_step_wired_14">تم إرسال StartSession</string>
+    <string name="chain_step_wired_15">تمت الإجابة على mDNS</string>
+    <string name="chain_step_wired_16">الجلسة نشطة</string>
+    <string name="chain_step_wireless_01">محول Bluetooth</string>
+    <string name="chain_step_wireless_02">Bluetooth مفعّل</string>
+    <string name="chain_step_wireless_03">جارٍ الاتصال عبر RFCOMM</string>
+    <string name="chain_step_wireless_04">قناة iAP2</string>
+    <string name="chain_step_wireless_05">جارٍ تشغيل نقطة الاتصال</string>
+    <string name="chain_step_wireless_06">نقطة الاتصال جاهزة</string>
+    <string name="chain_step_wireless_07">جارٍ بث mDNS</string>
+    <string name="chain_step_wireless_08">تم فتح النفق</string>
+    <string name="chain_step_wireless_09">النفق جاهز</string>
+    <string name="chain_step_wireless_10">اكتمل التسليم</string>
+    <string name="chain_step_wireless_11">تم توصيل النقل</string>
+    <string name="chain_step_wireless_12">الجلسة نشطة</string>
+</resources>
